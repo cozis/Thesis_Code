@@ -1,0 +1,13 @@
+vsr_client
+vsr_server
+vsr_simulation
+raft_client
+raft_server
+raft_simulation
+raft_simulation_coverage
+*.gcno
+*.gcda
+*.gcov
+*.info
+coverage_html/
+*.log
