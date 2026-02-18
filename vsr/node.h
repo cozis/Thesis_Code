@@ -5,7 +5,7 @@
 #include <lib/basic.h>
 #include <lib/message.h>
 
-#include <state_machine/state_machine.h>
+#include <state_machine/kvstore.h>
 
 #include "log.h"
 #include "config.h"
@@ -28,22 +28,31 @@ enum {
     // Recovery Protocol
     MESSAGE_TYPE_RECOVERY,
     MESSAGE_TYPE_RECOVERY_RESPONSE,
+
+    // State Transfer Protocol
+    MESSAGE_TYPE_GET_STATE,
+    MESSAGE_TYPE_NEW_STATE,
+
+    // Client Redirect
+    MESSAGE_TYPE_REDIRECT,
 };
 
 typedef struct {
     MessageHeader base;
-    Operation oper;
+    KVStoreOper oper;
     uint64_t client_id;
     uint64_t request_id;
 } RequestMessage;
 
 typedef struct {
     MessageHeader base;
-    Operation oper;
+    KVStoreOper oper;
     int sender_idx;
     int log_index;
     int commit_index;
     uint64_t view_number;
+    uint64_t client_id;
+    uint64_t request_id;
 } PrepareMessage;
 
 typedef struct {
@@ -61,7 +70,8 @@ typedef struct {
 typedef struct {
     MessageHeader base;
     bool rejected;
-    OperationResult result;
+    KVStoreResult result;
+    uint64_t request_id;
 } ReplyMessage;
 
 typedef struct {
@@ -103,6 +113,26 @@ typedef struct {
     int sender_idx;
 } RecoveryResponseMessage;
 
+typedef struct {
+    MessageHeader base;
+    uint64_t view_number;
+    int op_number;      // Requester's current log count
+    int sender_idx;
+} GetStateMessage;
+
+typedef struct {
+    MessageHeader base;
+    uint64_t view_number;
+    int op_number;      // Number of log entries that follow
+    int commit_index;
+    // Followed by: LogEntry log[op_number]
+} NewStateMessage;
+
+typedef struct {
+    MessageHeader base;
+    uint64_t view_number;
+} RedirectMessage;
+
 typedef enum {
     STATUS_NORMAL,
     STATUS_CHANGE_VIEW,
@@ -120,27 +150,28 @@ typedef struct {
     Status status;
 
     ClientTable client_table;
+    int next_client_tag;
 
     uint64_t view_number;
+    uint64_t last_normal_view;  // Latest view where status was NORMAL
 
     // These fields are used in recovery mode
     uint32_t recovery_votes;
     uint64_t recovery_nonce;
-    uint64_t max_view_seen;
-    int      latest_primary_idx;
-    bool     received_primary_state;
-    Log      potential_primary_log;
-    Time     recovery_start_time;
-    int      recovery_attempt_count;
+    uint64_t recovery_view;
+    Log      recovery_log;
+    uint64_t recovery_log_view;
+    Time     recovery_time;
+    int      recovery_commit;
 
     ///////////////////////////////////////////////////////////
     // VIEW CHANGE
 
-    uint32_t begin_view_change_votes;  // Bitmask of received BeginViewChange messages
-    uint32_t do_view_change_votes;     // Bitmask of received DoViewChange messages
-    uint64_t do_view_change_best_old_view;  // Best old_view_number seen in DoViewChange
-    int      do_view_change_best_commit;    // Best commit_index seen
-    Log      do_view_change_best_log;       // Best log seen
+    uint32_t view_change_begin_votes;
+    uint32_t view_change_apply_votes;
+    Log      view_change_log; // Best log seen
+    uint64_t view_change_old_view;  // Best old_view_number seen in DoViewChange
+    int      view_change_commit;    // Best commit_index seen
 
     ///////////////////////////////////////////////////////////
 
@@ -152,11 +183,17 @@ typedef struct {
     PrepareMessage future[FUTURE_LIMIT];
     int num_future;
 
+    bool state_transfer_pending;
+    Time state_transfer_time;
+
     Log log;
 
-    Time last_heartbeat_time;
+    Time heartbeat;
 
-    StateMachine state_machine;
+    KVStore kvstore;
+
+    // Set at each wakeup
+    Time now;
 
 } NodeState;
 
@@ -171,6 +208,19 @@ int node_tick(void *state, void **ctxs,
 
 int node_free(void *state);
 
-void check_vsr_invariants(NodeState **nodes, int num_nodes);
+typedef struct {
+    int last_min_commit;
+    int last_max_commit;
+    Status prev_status[NODE_LIMIT];
+
+    // External shadow log of committed operations (unbounded, dynamically allocated)
+    KVStoreOper *shadow_log;
+    int shadow_count;
+    int shadow_capacity;
+} InvariantChecker;
+
+void invariant_checker_init(InvariantChecker *ic);
+void invariant_checker_free(InvariantChecker *ic);
+void invariant_checker_run(InvariantChecker *ic, NodeState **nodes, int num_nodes);
 
 #endif // NODE_INCLUDED

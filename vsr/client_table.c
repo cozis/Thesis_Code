@@ -28,7 +28,7 @@ ClientTableEntry *client_table_find(ClientTable *client_table, uint64_t client_i
     return NULL;
 }
 
-int client_table_add(ClientTable *client_table, uint64_t client_id, uint64_t request_id, int conn_idx)
+int client_table_add(ClientTable *client_table, uint64_t client_id, uint64_t request_id, int conn_tag)
 {
     if (client_table->count == client_table->capacity) {
         int n = 2 * client_table->capacity;
@@ -44,7 +44,7 @@ int client_table_add(ClientTable *client_table, uint64_t client_id, uint64_t req
         .client_id = client_id,
         .last_request_id = request_id,
         .pending = true,
-        .conn_idx = conn_idx,
+        .conn_tag = conn_tag,
     };
     return 0;
 }

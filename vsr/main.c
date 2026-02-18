@@ -4,7 +4,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <quakey.h>
-
+#include <assert.h>
 #include "node.h"
 #include "client.h"
 
@@ -16,12 +16,23 @@ static void sigint_handler(int sig)
     simulation_running = 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     signal(SIGINT, sigint_handler);
 
+    QuakeyUInt64 seed = 1;
+    QuakeyUInt64 time_limit_ns = 0; // 0 means no limit
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--time") == 0 && i + 1 < argc) {
+            time_limit_ns = strtoull(argv[++i], NULL, 10) * 1000000000ULL;
+        }
+    }
+
     Quakey *quakey;
-    int ret = quakey_init(&quakey, 1);
+    int ret = quakey_init(&quakey, seed);
     if (ret < 0)
         return -1;
 
@@ -111,7 +122,18 @@ int main(void)
         node_3 = quakey_spawn(quakey, config, "nd --peer 127.0.0.4:8080 --peer 127.0.0.5:8080 --addr 127.0.0.6:8080");
     }
 
-    while (simulation_running) {
+    // Limit crashes to 1 node at a time (within fault tolerance of f=1).
+    // This is dynamically adjusted below: crashes are disabled while
+    // any node is still recovering.
+    quakey_set_max_crashes(quakey, 1);
+
+    quakey_network_partitioning(quakey, true);
+
+    InvariantChecker invariant_checker;
+    invariant_checker_init(&invariant_checker);
+
+    while (simulation_running && (time_limit_ns == 0 || quakey_current_time(quakey) < time_limit_ns)) {
+
         quakey_schedule_one(quakey);
 
         NodeState *arr[] = {
@@ -119,9 +141,21 @@ int main(void)
             quakey_node_state(node_2),
             quakey_node_state(node_3),
         };
-        check_vsr_invariants(arr, sizeof(arr)/sizeof(arr[0]));
+        invariant_checker_run(&invariant_checker, arr, sizeof(arr)/sizeof(arr[0]));
+
+        // VR-Revisited Section 8.2: "a replica is considered failed
+        // until it has recovered its state." Disable crashes while
+        // any node is recovering to avoid exceeding f simultaneous
+        // failures (dead + recovering).
+        bool any_recovering = false;
+        for (int i = 0; i < 3; i++) {
+            if (arr[i] && arr[i]->status == STATUS_RECOVERY)
+                any_recovering = true;
+        }
+        quakey_set_max_crashes(quakey, any_recovering ? 0 : 1);
     }
 
+    invariant_checker_free(&invariant_checker);
     quakey_free(quakey);
     return 0;
 }

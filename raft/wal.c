@@ -4,9 +4,25 @@
 
 #include <quakey.h>
 #include <assert.h>
+#include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "wal.h"
+
+// FNV-1a checksum over all WALEntry fields except the checksum itself.
+uint32_t wal_entry_checksum(WALEntry *entry)
+{
+    uint32_t h = 2166136261u;
+    const unsigned char *p = (const unsigned char *)entry;
+    // Hash all bytes up to (but not including) the checksum field
+    size_t len = offsetof(WALEntry, checksum);
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
 
 int wal_init(WAL *wal, string file)
 {
@@ -21,25 +37,46 @@ int wal_init(WAL *wal, string file)
         return -1;
     }
 
-    if (size % sizeof(WALEntry) != 0) {
+    // Discard any partial trailing entry (crash during write).
+    int raw_count = size / sizeof(WALEntry);
+    size_t valid_size = raw_count * sizeof(WALEntry);
+    if (valid_size < size) {
+        file_truncate(handle, valid_size);
+    }
+
+    WALEntry *entries = malloc(raw_count * sizeof(WALEntry));
+    if (entries == NULL && raw_count > 0) {
         file_close(handle);
         return -1;
     }
-    int count = size / sizeof(WALEntry);
+
+    if (file_set_offset(handle, 0) < 0) {
+        file_close(handle);
+        free(entries);
+        return -1;
+    }
+
+    if (raw_count > 0 && file_read_exact(handle, (char*) entries, raw_count * sizeof(WALEntry)) < 0) {
+        file_close(handle);
+        free(entries);
+        return -1;
+    }
+
+    // Verify checksums: truncate at the first corrupted entry.
+    // All entries from a corrupted one onward are discarded.
+    int count = raw_count;
+    for (int i = 0; i < raw_count; i++) {
+        if (entries[i].checksum != wal_entry_checksum(&entries[i])) {
+            count = i;
+            file_truncate(handle, count * sizeof(WALEntry));
+            break;
+        }
+    }
 
     wal->count = count;
-    wal->capacity = count;
-    wal->entries = malloc(count * sizeof(WALEntry));
-    if (wal->entries == NULL) {
-        file_close(handle);
-        return -1;
-    }
-
-    if (file_read_exact(handle, (char*) wal->entries, count * sizeof(WALEntry)) < 0) {
-        file_close(handle);
-        return -1;
-    }
-
+    wal->capacity = raw_count; // capacity >= count
+    wal->entries = entries;
+    wal->handle = handle;
     return 0;
 }
 
@@ -61,12 +98,26 @@ int wal_append(WAL *wal, WALEntry *entry)
         wal->entries = p;
     }
 
-    // TODO: Should truncate file on partial writes
-    if (file_write_exact(wal->handle, (char*) entry, sizeof(*entry)) < 0)
-        return -1;
+    // Compute checksum before writing to disk
+    entry->checksum = wal_entry_checksum(entry);
 
-    if (file_sync(wal->handle) < 0)
+    if (file_write_exact(wal->handle, (char*) entry, sizeof(*entry)) < 0) {
+        // A partial write may have advanced the file offset. Truncate
+        // and rewind so the file stays consistent with the in-memory
+        // entry count.
+        file_truncate(wal->handle, wal->count * sizeof(WALEntry));
+        file_set_offset(wal->handle, wal->count * sizeof(WALEntry));
         return -1;
+    }
+
+    if (file_sync(wal->handle) < 0) {
+        // The write succeeded but sync failed. Rewind the offset and
+        // truncate the phantom entry so the next append writes to the
+        // correct position.
+        file_truncate(wal->handle, wal->count * sizeof(WALEntry));
+        file_set_offset(wal->handle, wal->count * sizeof(WALEntry));
+        return -1;
+    }
 
     wal->entries[wal->count++] = *entry;
     return 0;

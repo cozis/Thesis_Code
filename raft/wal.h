@@ -3,13 +3,17 @@
 
 #include <lib/file_system.h>
 
-#include <state_machine/state_machine.h>
+#include <state_machine/kvstore.h>
 
 typedef struct {
-    uint64_t  term;
-    uint64_t  client_id;
-    Operation oper;
+    uint64_t    term;
+    uint64_t    client_id;
+    uint64_t    request_id;
+    KVStoreOper oper;
+    uint32_t    checksum;
 } WALEntry;
+
+uint32_t wal_entry_checksum(WALEntry *entry);
 
 typedef struct {
     int       count;

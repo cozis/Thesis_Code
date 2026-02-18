@@ -3,14 +3,17 @@
 
 #include <stdint.h>
 
-#include <state_machine/state_machine.h>
+#include <state_machine/kvstore.h>
 
 typedef struct {
     uint64_t        client_id;
     uint64_t        last_request_id;
-    OperationResult last_result;
-    bool            pending;
-    int             conn_idx;
+    KVStoreResult   last_result;
+    bool            pending; // Only meaningful on the leader that received
+                             // the REQUEST. After a view change, a new leader
+                             // may find stale entries with pending=false from
+                             // a previous view when it was leader before.
+    int             conn_tag;
 } ClientTableEntry;
 
 typedef struct {
@@ -22,7 +25,7 @@ typedef struct {
 void client_table_init(ClientTable *client_table);
 void client_table_free(ClientTable *client_table);
 ClientTableEntry *client_table_find(ClientTable *client_table, uint64_t client_id);
-int client_table_add(ClientTable *client_table, uint64_t client_id, uint64_t request_id, int conn_idx);
+int client_table_add(ClientTable *client_table, uint64_t client_id, uint64_t request_id, int conn_tag);
 int client_table_insert(ClientTable *client_table, uint64_t client_id, uint64_t request_id);
 
 #endif // CLIENT_TABLE_INCLUDED

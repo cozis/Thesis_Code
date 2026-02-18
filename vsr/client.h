@@ -4,6 +4,8 @@
 #include <lib/tcp.h>
 #include <lib/basic.h>
 
+#include <state_machine/kvstore.h>
+
 #include "config.h"
 
 typedef struct {
@@ -14,6 +16,14 @@ typedef struct {
     bool pending;
     Time request_time; // When the current request was sent
 
+    // The operation sent in the current pending request (for logging)
+    KVStoreOper last_oper;
+
+    // Linearizability checker support
+    KVStoreResult last_result;
+    bool          last_was_timeout;
+    bool          last_was_rejected;
+
     Address server_addrs[NODE_LIMIT];
     int num_servers;
 
@@ -21,6 +31,8 @@ typedef struct {
 
     uint64_t client_id;
     uint64_t request_id;
+
+    Time reconnect_time; // Earliest time to retry connecting to leader
 
 } ClientState;
 

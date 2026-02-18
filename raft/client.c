@@ -9,12 +9,63 @@
 #include "node.h"
 #include "client.h"
 
-#define CLIENT_TRACE(fmt, ...) {}
-//#define CLIENT_TRACE(fmt, ...) fprintf(stderr, "CLIENT: " fmt "\n", ##__VA_ARGS__);
+//#define CLIENT_TRACE(fmt, ...) {}
+#define CLIENT_TRACE(fmt, ...) fprintf(stderr, "CLIENT: " fmt "\n", ##__VA_ARGS__);
 
 #define CLIENT_REQUEST_TIMEOUT_SEC 3
+#define KEY_POOL_SIZE 128
 
 static uint64_t next_client_id = 1;
+
+static uint64_t client_random(void)
+{
+#if defined(MAIN_SIMULATION) || defined(MAIN_TEST)
+    return quakey_random();
+#else
+    return (uint64_t)rand();
+#endif
+}
+
+static KVStoreOper random_oper(void)
+{
+    KVStoreOper oper = {0};
+    snprintf(oper.key, KVSTORE_KEY_SIZE, "k%d", (int)(client_random() % KEY_POOL_SIZE));
+
+    switch (client_random() % 3) {
+    case 0:
+        oper.type = KVSTORE_OPER_SET;
+        oper.val  = client_random();
+        break;
+    case 1:
+        oper.type = KVSTORE_OPER_GET;
+        break;
+    case 2:
+        oper.type = KVSTORE_OPER_DEL;
+        break;
+    }
+    return oper;
+}
+
+static const char *oper_type_name(KVStoreOperType t)
+{
+    switch (t) {
+    case KVSTORE_OPER_NOOP: return "NOOP";
+    case KVSTORE_OPER_SET:  return "SET";
+    case KVSTORE_OPER_GET:  return "GET";
+    case KVSTORE_OPER_DEL:  return "DEL";
+    }
+    return "???";
+}
+
+static const char *result_type_name(KVStoreResultType t)
+{
+    switch (t) {
+    case KVSTORE_RESULT_OK:      return "OK";
+    case KVSTORE_RESULT_FULL:    return "FULL";
+    case KVSTORE_RESULT_MISSING: return "MISSING";
+    }
+    return "???";
+}
 
 static int
 process_message(ClientState *state,
@@ -31,7 +82,12 @@ process_message(ClientState *state,
         if (redirect_message.leader_idx >= 0 && redirect_message.leader_idx < state->num_servers) {
             CLIENT_TRACE("Redirected to leader %d", redirect_message.leader_idx);
             state->current_leader = redirect_message.leader_idx;
-            // Retry immediately with the correct leader
+            // Retry immediately with the correct leader.
+            // A redirect means the server did not process the request,
+            // so mark as rejected (not timeout) for the linearizability
+            // checker: the outcome is unambiguous (no effect).
+            state->last_was_rejected = true;
+            state->last_was_timeout = false;
             state->pending = false;
         }
         return 0;
@@ -48,8 +104,24 @@ process_message(ClientState *state,
         return -1;
     memcpy(&reply_message, msg.ptr, sizeof(reply_message));
 
-    CLIENT_TRACE("Received reply for request %lu", (unsigned long)state->request_id);
+    // Ignore stale replies from previous requests. After a timeout
+    // the client moves to a new leader and sends a new request, but
+    // the old leader may still deliver a reply for the old request
+    // on the previous connection. Without this check the client
+    // would accept the stale result for the wrong operation.
+    if (reply_message.request_id != state->request_id)
+        return 0;
 
+    CLIENT_TRACE("REPLY: %s key=\"%.16s\" -> %s val=%lu (req_id=%lu)",
+        oper_type_name(state->last_oper.type),
+        state->last_oper.key,
+        result_type_name(reply_message.result.type),
+        (unsigned long)reply_message.result.val,
+        (unsigned long)state->request_id);
+
+    state->last_result = reply_message.result;
+    state->last_was_timeout = false;
+    state->last_was_rejected = false;
     state->pending = false;
     return 0;
 }
@@ -167,6 +239,8 @@ int client_tick(void *state_, void **ctxs,
         if (now >= request_deadline) {
             CLIENT_TRACE("Request %lu timed out, trying next server",
                 (unsigned long)state->request_id);
+            state->last_was_timeout = true;
+            state->last_was_rejected = false;
             state->pending = false;
             state->current_leader = (state->current_leader + 1) % state->num_servers;
         }
@@ -181,6 +255,7 @@ int client_tick(void *state_, void **ctxs,
             tcp_connect(&state->tcp, state->server_addrs[leader], leader, NULL);
         } else {
             state->request_id++;
+            state->last_oper = random_oper();
 
             RequestMessage request_message = {
                 .base = {
@@ -188,10 +263,17 @@ int client_tick(void *state_, void **ctxs,
                     .type    = MESSAGE_TYPE_REQUEST,
                     .length  = sizeof(RequestMessage),
                 },
-                .oper = OPERATION_A,
+                .oper = state->last_oper,
                 .client_id = state->client_id,
                 .request_id = state->request_id,
             };
+
+            CLIENT_TRACE("REQUEST: %s key=\"%.16s\" val=%lu (req_id=%lu, leader=%d)",
+                oper_type_name(state->last_oper.type),
+                state->last_oper.key,
+                (unsigned long)state->last_oper.val,
+                (unsigned long)state->request_id,
+                leader);
 
             ByteQueue *output = tcp_output_buffer(&state->tcp, conn_idx);
             if (output)

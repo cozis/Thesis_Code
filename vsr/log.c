@@ -13,9 +13,27 @@ void log_init(Log *log)
     log->entries = NULL;
 }
 
+int log_init_from_network(Log *log, void *src, int num)
+{
+    log->count = num;
+    log->capacity = num;
+    log->entries = malloc(num * sizeof(LogEntry));
+    if (log->entries == NULL)
+        return -1;
+    memcpy(log->entries, src, num * sizeof(LogEntry));
+    return 0;
+}
+
 void log_free(Log *log)
 {
     free(log->entries);
+}
+
+void log_move(Log *dst, Log *src)
+{
+    log_free(dst);
+    *dst = *src;
+    log_init(src);
 }
 
 int log_append(Log *log, LogEntry entry)

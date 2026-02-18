@@ -11,6 +11,10 @@
 
 #define TODO __builtin_trap()
 
+#define SIM_TRACE(sim, fmt, ...) \
+    fprintf(stderr, "SIM: [%.3fs] " fmt "\n", \
+        (double)(sim)->current_time / 1e9, ##__VA_ARGS__)
+
 #ifdef NDEBUG
 #define UNREACHABLE {}
 #define ASSERT(X) {}
@@ -317,6 +321,7 @@ typedef enum {
     EVENT_TYPE_DATA,
     EVENT_TYPE_WAKEUP,
     EVENT_TYPE_RESTART,
+    EVENT_TYPE_PARTITION,
 } TimeEventType;
 
 typedef struct {
@@ -355,6 +360,17 @@ typedef struct {
 
 #define SIM_SIGNAL_LIMIT 8
 
+typedef struct {
+    Host *a;
+    Host *b;
+} HostPair;
+
+typedef struct {
+    int count;
+    int capacity;
+    HostPair *pairs;
+} HostPairList;
+
 struct Sim {
 
     uint64_t seed;
@@ -378,15 +394,30 @@ struct Sim {
     int num_signals;
     int head_signal;
     QuakeySignal signals[SIM_SIGNAL_LIMIT];
+
+    // Network partition simulation. The partition list holds pairs
+    // of hosts whose link is currently broken. The target_partition
+    // holds the desired end state. A periodic timer event gradually
+    // breaks or repairs links to converge toward the target. Once
+    // reached, a new random target is generated.
+    HostPairList partition;
+    HostPairList target_partition;
+
+    // Maximum number of hosts that can be dead at the same time.
+    int max_crashes;
+
+    bool network_partitioning;
 };
 
 static void time_event_wakeup(Sim *sim, Nanos time, Host *host);
 static void time_event_connect(Sim *sim, Nanos time, Desc *desc);
 static void time_event_disconnect(Sim *sim, Nanos time, Desc *desc, b32 rst);
-static void time_event_send_data(Sim *sim, Nanos time, Desc *desc);
+static void time_event_send_data(Sim *sim, Nanos time, Desc *desc, int count);
 static void time_event_free(TimeEvent *event);
 static void time_event_restart(Sim *sim, Nanos time, Host *host);
+static void time_event_partition(Sim *sim, Nanos time);
 static void remove_events_targeting_desc(Sim *sim, Desc *desc);
+static b32  remove_wakeup_event(Sim *sim, Host *host);
 
 /////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////
@@ -714,11 +745,6 @@ static b32 socket_queue_empty(SocketQueue *queue)
     return queue->used == 0;
 }
 
-static b32 socket_queue_used(SocketQueue *queue)
-{
-    return queue->used;
-}
-
 /////////////////////////////////////////////////////////////////
 // Accept Queue Code
 
@@ -1003,9 +1029,10 @@ static void host_init(Host *host, Sim *sim, QuakeySpawn config, char *arg)
         TODO;
     }
 
-    if (host->poll_timeout > 0)
+    if (host->poll_timeout > 0) {
+        remove_wakeup_event(host->sim, host);
         time_event_wakeup(host->sim, host->sim->current_time + (Nanos)host->poll_timeout * 1000000ULL, host);
-    else if (host->poll_timeout == 0)
+    } else if (host->poll_timeout == 0)
         host->timedout = true;  // Immediate timeout, don't create event at current_time
 }
 
@@ -1035,8 +1062,11 @@ static void host_free(Host *host)
 }
 
 // Remove all events associated with a host (WAKEUP events and events
-// whose source or destination descriptors belong to this host)
-static void remove_events_for_host(Sim *sim, Host *host)
+// whose source or destination descriptors belong to this host).
+// If skip_restart is true, RESTART events are kept (used during
+// restart failure to avoid removing the event currently being
+// processed by process_events_at_current_time).
+static void remove_events_for_host_ex(Sim *sim, Host *host, bool skip_restart)
 {
     int i = 0;
     while (i < sim->num_events) {
@@ -1045,7 +1075,7 @@ static void remove_events_for_host(Sim *sim, Host *host)
 
         if (event->type == EVENT_TYPE_WAKEUP && event->host == host)
             remove = true;
-        if (event->type == EVENT_TYPE_RESTART && event->host == host)
+        if (!skip_restart && event->type == EVENT_TYPE_RESTART && event->host == host)
             remove = true;
         if (event->src_desc && event->src_desc->host == host)
             remove = true;
@@ -1059,6 +1089,11 @@ static void remove_events_for_host(Sim *sim, Host *host)
             i++;
         }
     }
+}
+
+static void remove_events_for_host(Sim *sim, Host *host)
+{
+    remove_events_for_host_ex(sim, host, false);
 }
 
 static int count_dead(Sim *sim)
@@ -1088,6 +1123,11 @@ static void host_crash(Host *host)
     // Remove all pending events for this host
     remove_events_for_host(sim, host);
 
+    // Let the application clean up (e.g. log the crash)
+    host___ = host;
+    host->free_func(host->state);
+    host___ = NULL;
+
     // Free application state
     free(host->state);
     host->state = NULL;
@@ -1098,7 +1138,6 @@ static void host_crash(Host *host)
     host->poll_count = 0;
     host->poll_timeout = -1;
 
-    printf("Quakey: Host crash (%d/%d dead)\n", count_dead(sim), sim->num_hosts);
 }
 
 // Restart a crashed host: re-initialize from saved config,
@@ -1163,17 +1202,37 @@ static void host_restart(Host *host)
     );
     host___ = NULL;
     if (ret < 0) {
-        // If the node fails to restart, mark it as dead again
+        // Clean up any descriptors created during the failed init
+        for (int i = 0; i < HOST_DESC_LIMIT; i++) {
+            if (host->desc[i].type != DESC_EMPTY)
+                desc_free(sim, &host->desc[i], true);
+        }
+        host->num_desc = 0;
+        // Skip removing RESTART events: this function is called from
+        // time_event_process (EVENT_TYPE_RESTART), so the current
+        // restart event is still in the array being iterated by
+        // process_events_at_current_time. Removing it here would cause
+        // the outer loop's swap-removal to discard an unrelated event.
+        remove_events_for_host_ex(sim, host, true);
+        free(host->state);
+        host->state = NULL;
         host->dead = true;
+
+        // Schedule another restart attempt. Init can fail due to
+        // transient I/O errors from fault injection; permanently
+        // killing the host would be unrealistic since a real
+        // process supervisor would keep retrying.
+        Nanos restart_delay = 1000000000ULL + (sim_random(sim) % 9000000000ULL);
+        time_event_restart(sim, sim->current_time + restart_delay, host);
         return;
     }
 
-    if (host->poll_timeout > 0)
+    if (host->poll_timeout > 0) {
+        remove_wakeup_event(sim, host);
         time_event_wakeup(sim, sim->current_time + (Nanos)host->poll_timeout * 1000000ULL, host);
-    else if (host->poll_timeout == 0)
+    } else if (host->poll_timeout == 0)
         host->timedout = true;
 
-    printf("Quakey: Host restart (%d/%d dead)\n", count_dead(sim), sim->num_hosts);
 }
 
 static b32 host_is_linux(Host *host)
@@ -1343,12 +1402,16 @@ static void host_update(Host *host)
     );
     host___ = NULL;
     if (ret < 0) {
-        TODO;
+        host_crash(host);
+        Nanos restart_delay = 1000000000ULL + (sim_random(host->sim) % 9000000000ULL);
+        time_event_restart(host->sim, host->sim->current_time + restart_delay, host);
+        return;
     }
 
-    if (host->poll_timeout > 0)
+    if (host->poll_timeout > 0) {
+        remove_wakeup_event(host->sim, host);
         time_event_wakeup(host->sim, host->sim->current_time + (Nanos)host->poll_timeout * 1000000ULL, host);
-    else if (host->poll_timeout == 0)
+    } else if (host->poll_timeout == 0)
         host->timedout = true;  // Immediate timeout, don't create event at current_time
 }
 
@@ -1445,9 +1508,15 @@ static int host_create_pipe(Host *host, int *desc_idxs)
         return HOST_ERROR_FULL;
     Desc *desc_1 = &host->desc[desc_idx_1];
 
+    // Mark the first slot as in-use before searching for the second,
+    // otherwise find_empty_desc_struct returns the same index twice.
+    desc_1->type = DESC_PIPE;
+
     int desc_idx_2 = find_empty_desc_struct(host);
-    if (desc_idx_2 < 0)
+    if (desc_idx_2 < 0) {
+        desc_1->type = DESC_EMPTY;
         return HOST_ERROR_FULL;
+    }
     Desc *desc_2 = &host->desc[desc_idx_2];
 
     desc_1->type = DESC_PIPE;
@@ -1894,7 +1963,7 @@ static int send_inner(Desc *desc, char *src, int len)
     uint64_t rng = sim_random(sim);
     latency = 1000000 + (rng % 99000000); // between 1ms and 100ms
 #endif
-    time_event_send_data(desc->host->sim, desc->host->sim->current_time + latency, desc);
+    time_event_send_data(desc->host->sim, desc->host->sim->current_time + latency, desc, ret);
 
     return ret;
 }
@@ -1916,7 +1985,7 @@ static int host_read(Host *host, int desc_idx, char *dst, int len)
         desc->type == DESC_PIPE) {
         num = recv_inner(desc, dst, len);
     } else if (desc->type == DESC_FILE) {
-#ifdef FAULT_INJECTION
+#if defined(FAULT_INJECTION) && !defined(DISABLE_SPURIOUS_IO_ERRORS)
         uint64_t roll = sim_random(host->sim) % 1000;
         if (roll == 0) return HOST_ERROR_IO;
 #endif
@@ -1960,7 +2029,7 @@ static int host_write(Host *host, int desc_idx, char *src, int len)
         desc->type == DESC_PIPE) {
         num = send_inner(desc, src, len);
     } else if (desc->type == DESC_FILE) {
-#ifdef FAULT_INJECTION
+#if defined(FAULT_INJECTION) && !defined(DISABLE_SPURIOUS_IO_ERRORS)
         uint64_t roll = sim_random(host->sim) % 1000;
         if (roll == 0) return HOST_ERROR_IO;
         if (roll == 1) return HOST_ERROR_NOSPC;
@@ -2000,9 +2069,11 @@ static int host_recv(Host *host, int desc_idx, char *dst, int len)
     Desc *desc = &host->desc[desc_idx];
 
 #ifdef FAULT_INJECTION
-    Sim *sim = desc->host->sim;
-    uint64_t rng = sim_random(sim);
-    len = 1 + (rng % len);
+    if (len > 0) {
+        Sim *sim = desc->host->sim;
+        uint64_t rng = sim_random(sim);
+        len = 1 + (rng % len);
+    }
 #endif
 
     int num = 0;
@@ -2024,9 +2095,11 @@ static int host_send(Host *host, int desc_idx, char *src, int len)
     Desc *desc = &host->desc[desc_idx];
 
 #ifdef FAULT_INJECTION
-    Sim *sim = desc->host->sim;
-    uint64_t rng = sim_random(sim);
-    len = 1 + (rng % len);
+    if (len > 0) {
+        Sim *sim = desc->host->sim;
+        uint64_t rng = sim_random(sim);
+        len = 1 + (rng % len);
+    }
 #endif
 
     int num = 0;
@@ -2132,7 +2205,7 @@ static int host_fsync(Host *host, int desc_idx)
     if (desc->type != DESC_FILE)
         return HOST_ERROR_BADIDX;
 
-#ifdef FAULT_INJECTION
+#if defined(FAULT_INJECTION) && !defined(DISABLE_SPURIOUS_IO_ERRORS)
     uint64_t roll = sim_random(host->sim) % 100;
     if (roll == 0)
         return HOST_ERROR_IO;
@@ -2251,6 +2324,19 @@ static b32 remove_connect_event(Sim *sim, Desc *desc)
     return true;
 }
 
+static b32 remove_wakeup_event(Sim *sim, Host *host)
+{
+    int i = 0;
+    while (i < sim->num_events && (sim->events[i].type != EVENT_TYPE_WAKEUP || sim->events[i].host != host))
+        i++;
+
+    if (i == sim->num_events)
+        return false;
+
+    sim->events[i] = sim->events[--sim->num_events];
+    return true;
+}
+
 // Remove all events that target a specific descriptor (DISCONNECT and DATA events)
 static void remove_events_targeting_desc(Sim *sim, Desc *desc)
 {
@@ -2292,7 +2378,7 @@ static void time_event_disconnect(Sim *sim, Nanos time, Desc *desc, b32 rst)
     append_event(sim, event);
 }
 
-static void time_event_send_data(Sim *sim, Nanos time, Desc *desc)
+static void time_event_send_data(Sim *sim, Nanos time, Desc *desc, int count)
 {
     TimeEvent event = {
         .type = EVENT_TYPE_DATA,
@@ -2300,7 +2386,7 @@ static void time_event_send_data(Sim *sim, Nanos time, Desc *desc)
         .host = NULL,
         .src_desc = NULL,
         .dst_desc = desc->peer,
-        .data_count = socket_queue_used(desc->output),
+        .data_count = count,
         .data_queue = socket_queue_ref(desc->output),
         .rst = false,
     };
@@ -2328,12 +2414,52 @@ static void time_event_restart(Sim *sim, Nanos time, Host *host)
     append_event(sim, event);
 }
 
-static int sim_find_host(Sim *sim, Addr addr);
+static void time_event_partition(Sim *sim, Nanos time)
+{
+    TimeEvent event = {
+        .type = EVENT_TYPE_PARTITION,
+        .time = time,
+    };
+    append_event(sim, event);
+}
+
+static int  sim_find_host(Sim *sim, Addr addr);
+static int  change_target_partition(Sim *sim);
+static bool break_or_repair_link(Sim *sim);
+static bool hosts_are_partitioned(Sim *sim, Host *a, Host *b);
+
+static Nanos pick_partition_delay(Sim *sim, bool longer)
+{
+    Nanos min_delay = 1000000000; // 1s
+    Nanos max_delay = 10000000000; // 10s
+    if (longer) {
+        min_delay = 10000000000;
+        max_delay = 20000000000;
+    }
+    return min_delay + sim_random(sim) % (max_delay - min_delay);
+}
 
 static b32 time_event_process(TimeEvent *event, Sim *sim)
 {
     b32 consumed = true;
     switch (event->type) {
+    case EVENT_TYPE_PARTITION:
+        {
+            // Try to move one step toward the target partition.
+            // If current already matches target, pick a new target.
+            if (!break_or_repair_link(sim)) {
+                if (sim->network_partitioning) {
+                    if (change_target_partition(sim) < 0) {
+                        TODO;
+                    }
+                }
+            }
+
+            // Reschedule for the next partition step
+            event->time = sim->current_time + pick_partition_delay(sim, true);
+            consumed = false;
+        }
+        break;
     case EVENT_TYPE_CONNECT:
         {
             Desc *src_desc = event->src_desc;
@@ -2345,6 +2471,13 @@ static b32 time_event_process(TimeEvent *event, Sim *sim)
                 break;
             }
             Host *peer_host = sim->hosts[idx];
+
+            if (hosts_are_partitioned(sim, src_desc->host, peer_host)) {
+                //SIM_TRACE(sim, "PARTITION: blocked connection %s -> %s",
+                //    src_desc->host->name, peer_host->name);
+                src_desc->connect_status = CONNECT_STATUS_NOHOST;
+                break;
+            }
 
             Desc *peer = host_find_desc_bound_to(peer_host,
                 src_desc->connect_addr, src_desc->connect_port);
@@ -2410,6 +2543,242 @@ static b32 time_event_process(TimeEvent *event, Sim *sim)
 /////////////////////////////////////////////////////////////////
 // Sim Code
 
+static void
+host_pair_list_init(HostPairList *list)
+{
+    list->count = 0;
+    list->capacity = 0;
+    list->pairs = NULL;
+}
+
+static void
+host_pair_list_free(HostPairList *list)
+{
+    free(list->pairs);
+}
+
+static bool
+host_pair_list_exists(HostPairList *list, Host *a, Host *b)
+{
+    for (int i = 0; i < list->count; i++)
+        if ((list->pairs[i].a == a && list->pairs[i].b == b) ||
+            (list->pairs[i].a == b && list->pairs[i].b == a))
+            return true;
+    return false;
+}
+
+static int
+host_pair_list_add(HostPairList *list, Host *a, Host *b)
+{
+    if (!host_pair_list_exists(list, a, b)) {
+        if (list->count == list->capacity) {
+            int n = 2 * list->count;
+            if (n < 8) n = 8;
+            void *p = realloc(list->pairs, n * sizeof(HostPair));
+            if (p == NULL)
+                return -1;
+            list->capacity = n;
+            list->pairs = p;
+        }
+        list->pairs[list->count++] = (HostPair) { a, b };
+    }
+    return 0;
+}
+
+static void
+host_pair_list_remove_at(HostPairList *list, int idx)
+{
+    list->pairs[idx] = list->pairs[--list->count];
+}
+
+// Generate a new random target partition by assigning hosts to
+// random buckets. Hosts in the same bucket can communicate; hosts
+// in different buckets have their link marked as broken.
+static int change_target_partition(Sim *sim)
+{
+    HostPairList list;
+    host_pair_list_init(&list);
+
+    #define MAX_BUCKETS 3
+    #define MAX_NODES_PER_BUCKET 8
+
+    int   num_buckets = 1 + sim_random(sim) % MAX_BUCKETS;
+
+    Host *buckets[MAX_BUCKETS][MAX_NODES_PER_BUCKET];
+    int   bucket_sizes[MAX_BUCKETS];
+
+    for (int i = 0; i < num_buckets; i++)
+        bucket_sizes[i] = 0;
+
+    // Randomly assign each host to a bucket
+    for (int i = 0; i < sim->num_hosts; i++) {
+        int bucket_index = sim_random(sim) % num_buckets;
+        buckets[bucket_index][bucket_sizes[bucket_index]++] = sim->hosts[i];
+    }
+
+    // Every cross-bucket pair is a broken link in the target
+    for (int i = 0; i < num_buckets; i++) {
+        for (int j = 0; j < bucket_sizes[i]; j++) {
+            for (int k = 0; k < num_buckets; k++) {
+                if (k == i) continue;
+                for (int g = 0; g < bucket_sizes[k]; g++) {
+                    Host *a = buckets[i][j];
+                    Host *b = buckets[k][g];
+                    if (host_pair_list_add(&list, a, b) < 0) {
+                        host_pair_list_free(&list);
+                        return -1;
+                    }
+                }
+            }
+        }
+    }
+
+    host_pair_list_free(&sim->target_partition);
+    sim->target_partition = list;
+    //SIM_TRACE(sim, "PARTITION: new target partition with %d broken links (%d buckets)",
+    //    list.count, num_buckets);
+    return 0;
+}
+
+// Pick a random pair that exists in 'left' but not in 'right'.
+// Returns the index into 'left', or -1 if no such pair exists.
+static int pick_random_from_left_not_in_right(Sim *sim,
+    HostPairList *left, HostPairList *right)
+{
+    int *arr = malloc(left->count * sizeof(int));
+    if (arr == NULL) {
+        TODO; // Allowing this to return error would make execution not deterministic
+    }
+    int num = 0;
+
+    for (int i = 0; i < left->count; i++) {
+        HostPair pair = left->pairs[i];
+        if (!host_pair_list_exists(right, pair.a, pair.b)) {
+            arr[num++] = i;
+        }
+    }
+
+    int idx;
+    if (num == 0) {
+        idx = -1;
+    } else {
+        idx = arr[sim_random(sim) % num];
+    }
+
+    free(arr);
+    return idx;
+}
+
+// Forcefully reset a connection socket and notify its peer.
+// Removes any pending time events that reference either end.
+static void reset_conn(Sim *sim, Desc *desc)
+{
+    assert(desc->type == DESC_SOCKET_C);
+
+    if (desc->connect_status == CONNECT_STATUS_WAIT ||
+        desc->connect_status == CONNECT_STATUS_DONE) {
+
+        remove_events_targeting_desc(sim, desc);
+
+        if (desc->peer) {
+            assert(desc->peer->type == DESC_SOCKET_C
+                || desc->peer->type == DESC_SOCKET_L);
+
+            if (desc->peer->type == DESC_SOCKET_C) {
+                remove_events_targeting_desc(sim, desc->peer);
+                desc->peer->connect_status = CONNECT_STATUS_RESET;
+                desc->peer->peer = NULL;
+            } else {
+                accept_queue_remove(&desc->peer->accept_queue, desc);
+            }
+            desc->peer = NULL;
+        }
+
+        desc->connect_status = CONNECT_STATUS_RESET;
+    }
+}
+
+// Reset all active connections between two hosts (both directions)
+static void drop_conns_between_hosts(Sim *sim, Host *host, Host *peer)
+{
+    for (int i = 0, j = 0; j < host->num_desc; i++) {
+
+        Desc *desc = &host->desc[i];
+        if (desc->type == DESC_EMPTY)
+            continue;
+        j++;
+
+        if (desc->type == DESC_SOCKET_C && desc->peer && desc->peer->host == peer)
+            reset_conn(sim, desc);
+    }
+
+    for (int i = 0, j = 0; j < peer->num_desc; i++) {
+
+        Desc *desc = &peer->desc[i];
+        if (desc->type == DESC_EMPTY)
+            continue;
+        j++;
+
+        if (desc->type == DESC_SOCKET_C && desc->peer && desc->peer->host == host)
+            reset_conn(sim, desc);
+    }
+}
+
+// Break a link that is in the target but not yet in current
+static bool break_link(Sim *sim)
+{
+    int idx = pick_random_from_left_not_in_right(sim,
+        &sim->target_partition, &sim->partition);
+    if (idx < 0)
+        return false;
+    HostPair pair = sim->target_partition.pairs[idx];
+
+    host_pair_list_add(&sim->partition, pair.a, pair.b);
+    drop_conns_between_hosts(sim, pair.a, pair.b);
+    //SIM_TRACE(sim, "PARTITION: break link %s <-> %s (%d broken links)",
+    //    pair.a->name, pair.b->name, sim->partition.count);
+    return true;
+}
+
+// Repair a link that is broken in current but not in the target
+static bool repair_link(Sim *sim)
+{
+    int idx = pick_random_from_left_not_in_right(sim,
+        &sim->partition, &sim->target_partition);
+    if (idx < 0)
+        return false;
+
+    //HostPair pair = sim->partition.pairs[idx];
+    host_pair_list_remove_at(&sim->partition, idx);
+    //SIM_TRACE(sim, "PARTITION: repair link %s <-> %s (%d broken links)",
+    //    pair.a->name, pair.b->name, sim->partition.count);
+    return true;
+}
+
+// Try to move one step toward the target: randomly attempt a
+// break or repair first, falling back to the other on failure.
+// Returns false when current already matches the target.
+static bool break_or_repair_link(Sim *sim)
+{
+    if (sim_random(sim) & 1) {
+        if (break_link(sim))
+            return true;
+        if (repair_link(sim))
+            return true;
+    } else {
+        if (repair_link(sim))
+            return true;
+        if (break_link(sim))
+            return true;
+    }
+    return false;
+}
+
+static bool hosts_are_partitioned(Sim *sim, Host *a, Host *b)
+{
+    return host_pair_list_exists(&sim->partition, a, b);
+}
+
 static void sim_init(Sim *sim, uint64_t seed)
 {
     sim->seed = seed;
@@ -2422,10 +2791,27 @@ static void sim_init(Sim *sim, uint64_t seed)
     sim->events = NULL;
     sim->num_signals = 0;
     sim->head_signal = 0;
+    sim->max_crashes = 0;
+    sim->network_partitioning = true;
+    host_pair_list_init(&sim->partition);
+    host_pair_list_init(&sim->target_partition);
+    time_event_partition(sim, pick_partition_delay(sim, false));
+}
+
+static void sim_network_partitioning(Sim *sim, bool enable)
+{
+    sim->network_partitioning = enable;
+    if (!enable) {
+        host_pair_list_free(&sim->target_partition);
+        host_pair_list_init(&sim->target_partition);
+    }
 }
 
 static void sim_free(Sim *sim)
 {
+    host_pair_list_free(&sim->target_partition);
+    host_pair_list_free(&sim->partition);
+
     for (int i = 0; i < sim->num_hosts; i++)
         host_free(sim->hosts[i]);
     free(sim->hosts);
@@ -2503,6 +2889,9 @@ static void process_events_at_current_time(Sim *sim)
                 }
         }
     }
+
+    //if (sim->num_events > 10000)
+    //    SIM_TRACE(sim, "WARNING: event queue large: %d events", sim->num_events);
 }
 
 static int find_first_ready_host(Sim *sim)
@@ -2565,14 +2954,14 @@ static b32 sim_update(Sim *sim)
     if (sim->num_hosts > 1) {
         uint64_t rng = sim_random(sim);
         if ((rng % 10000) == 0) {
-            // Pick a random live host to crash
+
             int live_count = 0;
             for (int i = 0; i < sim->num_hosts; i++)
                 if (!sim->hosts[i]->dead)
                     live_count++;
+            int dead_count = sim->num_hosts - live_count;
 
-            // Only crash if at least 2 hosts are alive (keep a majority)
-            if (live_count >= 2) {
+            if (dead_count < sim->max_crashes) {
                 // Pick one of the live hosts at random
                 int target = sim_random(sim) % live_count;
                 int j = 0;
@@ -2664,6 +3053,18 @@ void quakey_free(Quakey *quakey)
     }
 }
 
+void quakey_set_max_crashes(Quakey *quakey, int max_crashes)
+{
+    Sim *sim = (Sim*) quakey;
+    sim->max_crashes = max_crashes;
+}
+
+void quakey_network_partitioning(Quakey *quakey, bool enable)
+{
+    Sim *sim = (Sim*) quakey;
+    sim_network_partitioning(sim, enable);
+}
+
 QuakeyNode quakey_spawn(Quakey *quakey, QuakeySpawn config, char *arg)
 {
     return (QuakeyNode) sim_spawn((Sim*) quakey, config, arg);
@@ -2678,6 +3079,12 @@ void *quakey_node_state(QuakeyNode node)
 int quakey_schedule_one(Quakey *quakey)
 {
     return sim_update((Sim*) quakey);
+}
+
+QuakeyUInt64 quakey_current_time(Quakey *quakey)
+{
+    Sim *sim = (Sim*) quakey;
+    return sim->current_time;
 }
 
 QuakeyUInt64 quakey_random(void)
@@ -2821,6 +3228,11 @@ int mock_close(int fd)
     }
 
     return 0;
+}
+
+int mock_access(const char *path, int mode)
+{
+    assert(0); // TODO
 }
 
 static int convert_addr(void *addr, size_t addr_len,

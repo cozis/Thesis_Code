@@ -7,6 +7,7 @@
 
 #include "wal.h"
 #include "config.h"
+#include "client_table.h"
 
 enum {
     MESSAGE_TYPE_REQUEST_VOTE,
@@ -28,6 +29,7 @@ typedef struct {
 
 typedef struct {
     MessageHeader base;
+    int      sender_idx;
     uint64_t term;
     uint8_t  value;
 } VotedMessage;
@@ -53,34 +55,21 @@ typedef struct {
 
 typedef struct {
     MessageHeader base;
-    Operation oper;
+    KVStoreOper oper;
     uint64_t client_id;
     uint64_t request_id;
 } RequestMessage;
 
 typedef struct {
     MessageHeader base;
-    OperationResult result;
+    KVStoreResult result;
+    uint64_t request_id;
 } ReplyMessage;
 
 typedef struct {
     MessageHeader base;
     int leader_idx;
 } RedirectMessage;
-
-typedef struct {
-    uint64_t        client_id;
-    uint64_t        last_request_id;
-    OperationResult last_result;
-    bool            pending;
-    int             conn_tag;
-} ClientTableEntry;
-
-typedef struct {
-    int count;
-    int capacity;
-    ClientTableEntry *entries;
-} ClientTable;
 
 typedef enum {
     ROLE_FOLLOWER,
@@ -90,45 +79,73 @@ typedef enum {
 
 typedef struct {
 
-    TCP tcp;
-    WAL wal;
+    // In-memory copy of the term and vote values.
+    // These must always be updated after the version
+    // stored on disk.
+    uint64_t term;
+    int      voted_for;
 
+    // Handle to the file backing the term and vote
+    // values.
+    Handle handle;
+} TermAndVote;
+
+typedef struct {
+
+    // Networking subsystem
+    TCP tcp;
+
+    // Static list of cluster nodes
     Address self_addr;
     Address node_addrs[NODE_LIMIT];
     int     num_nodes;
 
+    // Current loder of the node and the
+    // current leader. If no leader, -1.
     Role role;
+    int  leader_idx;
 
-    uint64_t term;
-    int      voted_for;
-    Handle   term_and_vote_handle;
+    // Votes received when candidate.
+    // Each bit is associated to a node. The
+    // number of votes is obtained by counting
+    // set bits. This ensures nodes won't vote
+    // twice.
+    uint32_t votes;
 
-    // Index of the current leader
-    int leader_idx;
+    // Durable log subsystem
+    WAL wal;
+
+    // Durable fixed-size data subsystem
+    TermAndVote term_and_vote;
+
+    // Current election timeout. This value is relative
+    // and must be summed to the heartbeat in order to
+    // get the absolute election deadline.
+    uint64_t election_timeout;
+
+    // This is the current value of the node.
+    // It is set at the start of each event
+    // handler call.
+    Time now;
+
+    // If leader, this is the time when the last
+    // heartbeat was sent. If follower, this is
+    // the last time a heartbeat was received.
+    Time heartbeat;
+
+    // The state machine to be replicated.
+    KVStore kvstore;
+
+    // Table of client requests. This ensures request
+    // are applied in order.
+    ClientTable client_table;
+    int next_client_tag;
 
     int commit_index;
     int last_applied;
 
-    // When CANDIDATE
-    int votes_received;
-
-    // When LEADER
     int next_indices[NODE_LIMIT];
     int match_indices[NODE_LIMIT];
-
-    // Relative timeout in nanoseconds
-    uint64_t election_timeout;
-
-    // Last heartbeat time
-    uint64_t watchdog;
-
-    // Keep track of client request order to enforce
-    // linearizability
-    ClientTable client_table;
-    int next_client_tag;
-
-    // The state machine to be replicated
-    StateMachine state_machine;
 
 } NodeState;
 

@@ -36,7 +36,7 @@ int file_open(string path, Handle *fd)
     memcpy(zt, path.ptr, path.len);
     zt[path.len] = '\0';
 
-    int ret = open(zt, O_RDWR | O_CREAT | O_APPEND, 0644);
+    int ret = open(zt, O_RDWR | O_CREAT, 0644);
     if (ret < 0)
         return -1;
 

@@ -8,6 +8,7 @@
 
 #include "node.h"
 #include "client.h"
+#include "invariant_checker.h"
 
 static volatile int simulation_running = 1;
 
@@ -17,14 +18,31 @@ static void sigint_handler(int sig)
     simulation_running = 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     signal(SIGINT, sigint_handler);
 
+    QuakeyUInt64 seed = 2;
+    QuakeyUInt64 time_limit_ns = 0; // 0 means no limit
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--time") == 0 && i + 1 < argc) {
+            time_limit_ns = strtoull(argv[++i], NULL, 10) * 1000000000ULL;
+        }
+    }
+
     Quakey *quakey;
-    int ret = quakey_init(&quakey, 2);
+    int ret = quakey_init(&quakey, seed);
     if (ret < 0)
         return -1;
+
+    QuakeyNode cli_1;
+    QuakeyNode cli_2;
+    QuakeyNode node_1;
+    QuakeyNode node_2;
+    QuakeyNode node_3;
 
     // Client 1
     {
@@ -39,7 +57,7 @@ int main(void)
             .disk_size  = 10<<20,
             .platform   = QUAKEY_LINUX,
         };
-        quakey_spawn(quakey, config, "cli --server 127.0.0.4:8080 --server 127.0.0.5:8080 --server 127.0.0.6:8080");
+        cli_1 = quakey_spawn(quakey, config, "cli --server 127.0.0.4:8080 --server 127.0.0.5:8080 --server 127.0.0.6:8080");
     }
 
     // Client 2
@@ -55,7 +73,7 @@ int main(void)
             .disk_size  = 10<<20,
             .platform   = QUAKEY_LINUX,
         };
-        quakey_spawn(quakey, config, "cli --server 127.0.0.4:8080 --server 127.0.0.5:8080 --server 127.0.0.6:8080");
+        cli_2 = quakey_spawn(quakey, config, "cli --server 127.0.0.4:8080 --server 127.0.0.5:8080 --server 127.0.0.6:8080");
     }
 
     // Node 1
@@ -71,7 +89,7 @@ int main(void)
             .disk_size  = 10<<20,
             .platform   = QUAKEY_LINUX,
         };
-        quakey_spawn(quakey, config, "nd --addr 127.0.0.4:8080 --peer 127.0.0.5:8080 --peer 127.0.0.6:8080");
+        node_1 = quakey_spawn(quakey, config, "nd --addr 127.0.0.4:8080 --peer 127.0.0.5:8080 --peer 127.0.0.6:8080");
     }
 
     // Node 2
@@ -87,7 +105,7 @@ int main(void)
             .disk_size  = 10<<20,
             .platform   = QUAKEY_LINUX,
         };
-        quakey_spawn(quakey, config, "nd --peer 127.0.0.4:8080 --addr 127.0.0.5:8080 --peer 127.0.0.6:8080");
+        node_2 = quakey_spawn(quakey, config, "nd --peer 127.0.0.4:8080 --addr 127.0.0.5:8080 --peer 127.0.0.6:8080");
     }
 
     // Node 3
@@ -103,12 +121,30 @@ int main(void)
             .disk_size  = 10<<20,
             .platform   = QUAKEY_LINUX,
         };
-        quakey_spawn(quakey, config, "nd --peer 127.0.0.4:8080 --peer 127.0.0.5:8080 --addr 127.0.0.6:8080");
+        node_3 = quakey_spawn(quakey, config, "nd --peer 127.0.0.4:8080 --peer 127.0.0.5:8080 --addr 127.0.0.6:8080");
     }
 
-    while (simulation_running)
+    // Limit crashes to 1 node at a time (within fault tolerance of f=1).
+    quakey_set_max_crashes(quakey, 1);
+
+    quakey_network_partitioning(quakey, true);
+
+    InvariantChecker invariant_checker;
+    invariant_checker_init(&invariant_checker);
+
+    while (simulation_running && (time_limit_ns == 0 || quakey_current_time(quakey) < time_limit_ns)) {
+
         quakey_schedule_one(quakey);
 
+        NodeState *arr[] = {
+            quakey_node_state(node_1),
+            quakey_node_state(node_2),
+            quakey_node_state(node_3),
+        };
+        invariant_checker_run(&invariant_checker, arr, sizeof(arr)/sizeof(arr[0]));
+    }
+
+    invariant_checker_free(&invariant_checker);
     quakey_free(quakey);
     return 0;
 }

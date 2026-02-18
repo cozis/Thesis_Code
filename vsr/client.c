@@ -6,17 +6,67 @@
 #include <stdint.h>
 #include <assert.h>
 
-#include <lib/file_system.h>
-
 #include "node.h"
 #include "client.h"
 
 //#define CLIENT_TRACE(fmt, ...) {}
 #define CLIENT_TRACE(fmt, ...) fprintf(stderr, "CLIENT: " fmt "\n", ##__VA_ARGS__);
 
+#define KEY_POOL_SIZE 128
+
+static uint64_t next_client_id = 1;
+
+static uint64_t client_random(void)
+{
+#if defined(MAIN_SIMULATION) || defined(MAIN_TEST)
+    return quakey_random();
+#else
+    return (uint64_t)rand();
+#endif
+}
+
+static KVStoreOper random_oper(void)
+{
+    KVStoreOper oper = {0};
+    snprintf(oper.key, KVSTORE_KEY_SIZE, "k%d", (int)(client_random() % KEY_POOL_SIZE));
+
+    switch (client_random() % 3) {
+    case 0:
+        oper.type = KVSTORE_OPER_SET;
+        oper.val  = client_random();
+        break;
+    case 1:
+        oper.type = KVSTORE_OPER_GET;
+        break;
+    case 2:
+        oper.type = KVSTORE_OPER_DEL;
+        break;
+    }
+    return oper;
+}
+
 // Format time as seconds with 3 decimal places for trace output
-#define TIME_FMT "%.3fs"
+#define TIME_FMT "%7.3fs"
 #define TIME_VAL(t) ((double)(t) / 1000000000.0)
+
+static void client_log_impl(ClientState *state, Time now, const char *event, const char *detail)
+{
+    printf("[" TIME_FMT "] CLIENT %lu | V%-3lu | %-20s %s\n",
+        TIME_VAL(now),
+        state->client_id,
+        state->view_number,
+        event,
+        detail ? detail : "");
+}
+
+#define client_log(state, now, event, fmt, ...) do {                \
+    char _detail[256];                                              \
+    snprintf(_detail, sizeof(_detail), fmt, ##__VA_ARGS__);         \
+    client_log_impl(state, now, event, _detail);                    \
+} while (0)
+
+#define client_log_simple(state, now, event) \
+    client_log_impl(state, now, event, NULL)
 
 static int leader_idx(ClientState *state)
 {
@@ -29,24 +79,61 @@ process_message(ClientState *state,
 {
     (void) conn_idx;
 
+    if (type == MESSAGE_TYPE_REDIRECT) {
+        RedirectMessage redirect_message;
+        if (msg.len != sizeof(RedirectMessage))
+            return -1;
+        memcpy(&redirect_message, msg.ptr, sizeof(redirect_message));
+
+        if (redirect_message.view_number > state->view_number) {
+            Time now = get_current_time();
+            client_log(state, now, "RECV REDIRECT", "view=%lu -> %lu leader=%d",
+                (unsigned long)state->view_number,
+                (unsigned long)redirect_message.view_number,
+                (int)(redirect_message.view_number % state->num_servers));
+            state->view_number = redirect_message.view_number;
+            state->last_was_rejected = true;
+            state->last_was_timeout = false;
+            state->pending = false;
+        }
+        return 0;
+    }
+
     if (!state->pending)
         return -1;
 
     if (type != MESSAGE_TYPE_REPLY)
         return -1;
 
-    ReplyMessage reply_message;
+    ReplyMessage message;
     if (msg.len != sizeof(ReplyMessage))
         return -1;
-    memcpy(&reply_message, msg.ptr, sizeof(reply_message));
+    memcpy(&message, msg.ptr, sizeof(message));
+
+    // Ignore stale replies from previous requests. After a timeout
+    // the client moves to a new view and sends a new request, but
+    // the old leader may still deliver a reply for the old request
+    // on the previous connection. Without this check the client
+    // would accept the stale result for the wrong operation.
+    if (message.request_id != state->request_id)
+        return 0;
 
     {
         Time now = get_current_time();
-        CLIENT_TRACE("[" TIME_FMT "] received REPLY (rejected=%s)",
-            TIME_VAL(now),
-            reply_message.rejected ? "true" : "false");
+        char oper_buf[64];
+        kvstore_snprint_oper(oper_buf, sizeof(oper_buf), state->last_oper);
+        if (message.rejected) {
+            client_log(state, now, "RECV REPLY", "key=%.16s %s -> REJECTED", state->last_oper.key, oper_buf);
+        } else {
+            char result_buf[64];
+            kvstore_snprint_result(result_buf, sizeof(result_buf), message.result);
+            client_log(state, now, "RECV REPLY", "key=%.16s %s -> %s", state->last_oper.key, oper_buf, result_buf);
+        }
     }
 
+    state->last_result = message.result;
+    state->last_was_timeout = false;
+    state->last_was_rejected = message.rejected;
     state->pending = false;
     return 0;
 }
@@ -92,35 +179,9 @@ int client_init(void *state_, int argc, char **argv,
 
     state->view_number = 0;
     state->request_id = 0;
+    state->reconnect_time = 0;
 
-    // Load or generate a persistent client_id from disk.
-    // This ensures the client_id survives process restarts.
-    {
-        string path = S("client_id");
-        Handle fd;
-        bool loaded = false;
-        if (file_exists(path)) {
-            if (file_open(path, &fd) == 0) {
-                file_set_offset(fd, 0);
-                uint64_t saved_id;
-                if (file_read_exact(fd, (char*)&saved_id, sizeof(saved_id)) == (int)sizeof(saved_id)) {
-                    state->client_id = saved_id;
-                    loaded = true;
-                }
-                file_close(fd);
-            }
-        }
-        if (!loaded) {
-            Time now = get_current_time();
-            state->client_id = (uint64_t)now;
-            if (file_open(path, &fd) == 0) {
-                file_set_offset(fd, 0);
-                file_write_exact(fd, (char*)&state->client_id, sizeof(state->client_id));
-                file_sync(fd);
-                file_close(fd);
-            }
-        }
-    }
+    state->client_id = next_client_id++;
 
     // Connect to all known servers
     for (int i = 0; i < state->num_servers; i++) {
@@ -133,8 +194,7 @@ int client_init(void *state_, int argc, char **argv,
 
     {
         Time now = get_current_time();
-        CLIENT_TRACE("[" TIME_FMT "] initialized: num_servers=%d, leader_idx=%d",
-            TIME_VAL(now), state->num_servers, leader_idx(state));
+        client_log(state, now, "INIT", "servers=%d leader=%d", state->num_servers, leader_idx(state));
     }
 
     *timeout = 0;
@@ -155,20 +215,24 @@ int client_tick(void *state_, void **ctxs,
     int num_events = tcp_translate_events(&state->tcp, events, ctxs, pdata, *pnum);
 
     for (int i = 0; i < num_events; i++) {
+
         if (events[i].type == EVENT_DISCONNECT) {
             int conn_idx = events[i].conn_idx;
             int tag = tcp_get_tag(&state->tcp, conn_idx);
             if (tag == leader_idx(state) && state->pending) {
                 Time now = get_current_time();
-                CLIENT_TRACE("[" TIME_FMT "] lost connection to leader (node %d), resetting pending request",
-                    TIME_VAL(now), leader_idx(state));
+                client_log(state, now, "DISCONNECT", "key=%.16s lost leader (node %d)", state->last_oper.key, leader_idx(state));
+                state->last_was_timeout = true;
+                state->last_was_rejected = false;
                 state->pending = false;
             }
             tcp_close(&state->tcp, conn_idx);
             continue;
         }
+
         if (events[i].type != EVENT_MESSAGE)
             continue;
+
         int conn_idx = events[i].conn_idx;
 
         for (;;) {
@@ -201,10 +265,16 @@ int client_tick(void *state_, void **ctxs,
     if (state->pending) {
         Time request_deadline = state->request_time + PRIMARY_DEATH_TIMEOUT_SEC * 1000000000ULL;
         if (request_deadline <= now) {
-            CLIENT_TRACE("[" TIME_FMT "] request to leader (node %d, view=%lu) timed out, trying next server",
-                TIME_VAL(now), leader_idx(state),
-                (unsigned long)state->view_number);
+
+            {
+                char oper_buf[64];
+                kvstore_snprint_oper(oper_buf, sizeof(oper_buf), state->last_oper);
+                client_log(state, now, "TIMEOUT", "key=%.16s %s", state->last_oper.key, oper_buf);
+            }
+
             state->view_number++;
+            state->last_was_timeout = true;
+            state->last_was_rejected = false;
             state->pending = false;
         }
     }
@@ -213,15 +283,15 @@ int client_tick(void *state_, void **ctxs,
 
         int conn_idx = tcp_index_from_tag(&state->tcp, leader_idx(state));
         if (conn_idx < 0) {
-            // Leader connection not available, try reconnecting
-            {
-                CLIENT_TRACE("[" TIME_FMT "] leader (node %d) not connected, reconnecting",
-                    TIME_VAL(now), leader_idx(state));
+            if (state->reconnect_time <= now) {
+                tcp_connect(&state->tcp, state->server_addrs[leader_idx(state)], leader_idx(state), NULL);
+                state->reconnect_time = now + HEARTBEAT_INTERVAL_SEC * 1000000000ULL;
             }
-            tcp_connect(&state->tcp, state->server_addrs[leader_idx(state)], leader_idx(state), NULL);
         } else {
+
             // Now start a new operation
             state->request_id++;
+            state->last_oper = random_oper();
 
             RequestMessage request_message = {
                 .base = {
@@ -229,7 +299,7 @@ int client_tick(void *state_, void **ctxs,
                     .type    = MESSAGE_TYPE_REQUEST,
                     .length  = sizeof(RequestMessage),
                 },
-                .oper = OPERATION_A,
+                .oper = state->last_oper,
                 .client_id = state->client_id,
                 .request_id = state->request_id,
             };
@@ -240,11 +310,9 @@ int client_tick(void *state_, void **ctxs,
             byte_queue_write(output, &request_message, request_message.base.length);
 
             {
-                CLIENT_TRACE("[" TIME_FMT "] sent REQUEST to leader (node %d, view=%lu, client_id=%lu, req_id=%lu)",
-                    TIME_VAL(now), leader_idx(state),
-                    (unsigned long)state->view_number,
-                    (unsigned long)state->client_id,
-                    (unsigned long)state->request_id);
+                char oper_buf[64];
+                kvstore_snprint_oper(oper_buf, sizeof(oper_buf), state->last_oper);
+                client_log(state, now, "SEND REQUEST", "key=%.16s %s", state->last_oper.key, oper_buf);
             }
 
             state->pending = true;
@@ -252,10 +320,15 @@ int client_tick(void *state_, void **ctxs,
         }
     }
 
-    // Set timeout based on pending request deadline
+    // Set timeout based on pending request deadline or reconnection delay
     Time deadline = INVALID_TIME;
     if (state->pending) {
         nearest_deadline(&deadline, state->request_time + PRIMARY_DEATH_TIMEOUT_SEC * 1000000000ULL);
+    } else {
+        int conn_idx = tcp_index_from_tag(&state->tcp, leader_idx(state));
+        if (conn_idx < 0 && state->reconnect_time > now) {
+            nearest_deadline(&deadline, state->reconnect_time);
+        }
     }
     *timeout = deadline_to_timeout(deadline, now);
     if (pcap < TCP_POLL_CAPACITY)
@@ -267,6 +340,11 @@ int client_tick(void *state_, void **ctxs,
 int client_free(void *state_)
 {
     ClientState *state = state_;
+
+    {
+        Time now = get_current_time();
+        client_log_simple(state, now, "CRASHED");
+    }
 
     tcp_context_free(&state->tcp);
     return 0;
