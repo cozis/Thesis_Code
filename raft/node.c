@@ -258,8 +258,18 @@ send_appended_response(NodeState *state, int conn_idx, bool success, int match_i
     return HR_OK;
 }
 
-static HandlerResult send_redirect(NodeState *state, int conn_idx)
+static HandlerResult send_redirect(NodeState *state, int conn_idx, ByteView msg)
 {
+    // Extract request_id from the client request so the client
+    // can discard stale redirects that arrive after a new request
+    // has already been sent (e.g. from a different server).
+    uint64_t request_id = 0;
+    if (msg.len == sizeof(RequestMessage)) {
+        RequestMessage req;
+        memcpy(&req, msg.ptr, sizeof(req));
+        request_id = req.request_id;
+    }
+
     RedirectMessage redirect_message = {
         .base = {
             .version = MESSAGE_VERSION,
@@ -267,6 +277,7 @@ static HandlerResult send_redirect(NodeState *state, int conn_idx)
             .length  = sizeof(RedirectMessage),
         },
         .leader_idx = state->leader_idx,
+        .request_id = request_id,
     };
 
     node_log(state, "SEND REDIRECT", "-> conn %d leader_idx=%d",
@@ -289,9 +300,6 @@ static void apply_committed(NodeState *state)
         state->last_applied++;
 
         WALEntry *wal_entry = wal_peek_entry(&state->wal, state->last_applied);
-
-        node_log(state, "APPLY", "entry %d (term %lu)",
-            state->last_applied, (unsigned long)wal_entry->term);
 
         KVStoreResult result = kvstore_update(&state->kvstore, wal_entry->oper);
 
@@ -488,9 +496,12 @@ static HandlerResult step_down(NodeState *state, uint64_t new_term)
         (unsigned long)state->term_and_vote.term, (unsigned long)new_term);
 
     state->role = ROLE_FOLLOWER;
+    state->leader_idx = -1;
 
-    if (set_term_and_vote(state, new_term, -1) < 0)
-        return HR_IO_FAILURE;
+    if (new_term != state->term_and_vote.term) {
+        if (set_term_and_vote(state, new_term, -1) < 0)
+            return HR_IO_FAILURE;
+    }
 
     return HR_OK;
 }
@@ -582,7 +593,7 @@ static bool remote_has_recent_state(NodeState *state,
 }
 
 static HandlerResult
-process_request_vote_for_folloer(NodeState *state, int conn_idx, ByteView msg)
+process_request_vote_for_follower(NodeState *state, int conn_idx, ByteView msg)
 {
     RequestVoteMessage request_vote_message;
     if (msg.len != sizeof(request_vote_message))
@@ -653,10 +664,10 @@ process_request_vote_for_candidate(NodeState *state, int conn_idx, ByteView msg)
     if (request_vote_message.term < state->term_and_vote.term)
         return send_vote_response(state, conn_idx, false, -1);
 
-    // Higher term: step down and consider the vote
-    HandlerResult hret = step_down(state, request_vote_message.term);
-    if (hret != HR_OK)
-        return hret;
+    {
+        HandlerResult hret = step_down(state, request_vote_message.term);
+        if (hret != HR_OK) return hret;
+    }
 
     if (remote_has_recent_state(state,
         request_vote_message.last_log_index,
@@ -675,8 +686,9 @@ process_voted_for_candidate(NodeState *state, int conn_idx, ByteView msg)
     memcpy(&message, msg.ptr, sizeof(message));
 
     // Local state is stale
-    if (message.term > state->term_and_vote.term)
+    if (message.term > state->term_and_vote.term) {
         return step_down(state, message.term);
+    }
 
     // Ignore votes from old terms
     if (message.term < state->term_and_vote.term)
@@ -712,9 +724,10 @@ process_append_entries_for_candidate(NodeState *state, int conn_idx, ByteView ms
         return send_appended_response(state, conn_idx, false, -1);
 
     // A valid leader exists for this or a higher term; step down
-    HandlerResult hret = step_down(state, append_entries_message.term);
-    if (hret != HR_OK)
-        return hret;
+    {
+        HandlerResult hret = step_down(state, append_entries_message.term);
+        if (hret != HR_OK) return hret;
+    }
 
     WALEntry *entries = (WALEntry*) (msg.ptr + sizeof(AppendEntriesMessage));
     return handle_append_entries(state, conn_idx, &append_entries_message, entries);
@@ -763,9 +776,10 @@ process_request_vote_for_leader(NodeState *state, int conn_idx, ByteView msg)
 
     if (request_vote_message.term > state->term_and_vote.term) {
 
-        HandlerResult hret = step_down(state, request_vote_message.term);
-        if (hret != HR_OK)
-            return hret;
+        {
+            HandlerResult hret = step_down(state, request_vote_message.term);
+            if (hret != HR_OK) return hret;
+        }
 
         if (remote_has_recent_state(state,
             request_vote_message.last_log_index,
@@ -789,9 +803,11 @@ process_append_entries_for_leader(NodeState *state, int conn_idx, ByteView msg)
 
     // Leader with a higher term exists? Step down
     if (append_entries_message.term > state->term_and_vote.term) {
-        HandlerResult hret = step_down(state, append_entries_message.term);
-        if (hret != HR_OK)
-            return hret;
+
+        {
+            HandlerResult hret = step_down(state, append_entries_message.term);
+            if (hret != HR_OK) return hret;
+        }
 
         WALEntry *entries = (WALEntry*) (msg.ptr + sizeof(AppendEntriesMessage));
         return handle_append_entries(state, conn_idx, &append_entries_message, entries);
@@ -813,10 +829,7 @@ process_appended_for_leader(NodeState *state, int conn_idx, ByteView msg)
 
     // Our state is stale
     if (appended_message.term > state->term_and_vote.term) {
-        HandlerResult hret = step_down(state, appended_message.term);
-        if (hret != HR_OK)
-            return hret;
-        return HR_OK;
+        return step_down(state, appended_message.term);
     }
 
     int follower_idx = appended_message.sender_idx;
@@ -964,11 +977,11 @@ process_message(NodeState *state,
     case ROLE_FOLLOWER:
         switch (type) {
         case MESSAGE_TYPE_REQUEST_VOTE:
-            return process_request_vote_for_folloer(state, conn_idx, msg);
+            return process_request_vote_for_follower(state, conn_idx, msg);
         case MESSAGE_TYPE_APPEND_ENTRIES:
             return process_append_entries_for_follower(state, conn_idx, msg);
         case MESSAGE_TYPE_REQUEST:
-            return send_redirect(state, conn_idx);
+            return send_redirect(state, conn_idx, msg);
         }
         return HR_OK;
 
@@ -981,7 +994,7 @@ process_message(NodeState *state,
         case MESSAGE_TYPE_APPEND_ENTRIES:
             return process_append_entries_for_candidate(state, conn_idx, msg);
         case MESSAGE_TYPE_REQUEST:
-            return send_redirect(state, conn_idx);
+            return send_redirect(state, conn_idx, msg);
         }
         return HR_OK;
     }
@@ -1074,6 +1087,7 @@ int node_init(void *state_, int argc, char **argv,
     string wal_file = S("raft.wal");
     string term_and_vote_file = S("term_and_vote.wal");
 
+    state->num_nodes = 0;
     bool self_addr_set = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--addr")) {

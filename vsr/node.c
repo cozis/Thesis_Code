@@ -157,11 +157,6 @@ static void begin_state_transfer(NodeState *state, int sender_idx)
 static HandlerResult
 process_request(NodeState *state, int conn_idx, ByteView msg)
 {
-    // Don't accept new requests during a view change.
-    // The leader must complete the view change first.
-    if (state->status != STATUS_NORMAL)
-        return HR_OK;
-
     RequestMessage request_message;
     if (msg.len != sizeof(request_message))
         return HR_INVALID_MESSAGE;
@@ -307,32 +302,9 @@ process_request(NodeState *state, int conn_idx, ByteView msg)
     return HR_OK;
 }
 
-static void reply_to_client(NodeState *state, uint64_t client_id,
+static void reply_to_client(NodeState *state, ClientTableEntry *table_entry,
     uint64_t request_id, KVStoreOper *oper, KVStoreResult result)
 {
-    // After a view change, the new leader inherits log
-    // entries but not the client table's pending state.
-    // A client table entry may exist from a previous view
-    // (when this node was leader before) with pending=false.
-    // Only reply if this leader received the original REQUEST.
-    ClientTableEntry *table_entry = client_table_find(&state->client_table, client_id);
-    if (table_entry == NULL)
-       return;
-
-    if (!table_entry->pending)
-        return;
-
-    // Verify this reply is for the request the client is actually
-    // waiting for. After a view change, the new leader inherits
-    // uncommitted log entries from the old view carrying a stale
-    // request_id. If the client has since sent a newer request,
-    // we must not confuse the old result with the new request.
-    if (table_entry->last_request_id != request_id)
-        return;
-
-    table_entry->pending = false;
-    table_entry->last_result = result;
-
     int conn_idx = tcp_index_from_tag(&state->tcp, table_entry->conn_tag);
     if (conn_idx < 0)
         return;
@@ -351,7 +323,7 @@ static void reply_to_client(NodeState *state, uint64_t client_id,
         char result_buf[64];
         kvstore_snprint_result(result_buf, sizeof(result_buf), result);
         node_log(state, "SEND REPLY", "client=%lu req=%lu key=%.16s %s",
-            client_id, request_id, oper->key, result_buf);
+            table_entry->client_id, request_id, oper->key, result_buf);
     }
 
     ByteQueue *output = tcp_output_buffer(&state->tcp, conn_idx);
@@ -375,9 +347,32 @@ static void advance_commit_index(NodeState *state, int target_index, bool send_r
             kvstore_snprint_result(result_buf, sizeof(result_buf), result);
             node_log(state, "APPLY", "idx=%d key=%.16s %s -> %s", state->commit_index-1, entry->oper.key, oper_buf, result_buf);
         }
-        if (send_replies) {
-            reply_to_client(state, entry->client_id, entry->request_id, &entry->oper, result);
-        }
+
+        // After a view change, the new leader inherits log
+        // entries but not the client table's pending state.
+        // A client table entry may exist from a previous view
+        // (when this node was leader before) with pending=false.
+        // Only reply if this leader received the original REQUEST.
+        ClientTableEntry *table_entry = client_table_find(&state->client_table, entry->client_id);
+        if (table_entry == NULL)
+            continue;
+
+        if (!table_entry->pending)
+            continue;
+
+        // Verify this reply is for the request the client is actually
+        // waiting for. After a view change, the new leader inherits
+        // uncommitted log entries from the old view carrying a stale
+        // request_id. If the client has since sent a newer request,
+        // we must not confuse the old result with the new request.
+        if (table_entry->last_request_id != entry->request_id)
+            continue;
+
+        table_entry->pending = false;
+        table_entry->last_result = result;
+
+        if (send_replies)
+            reply_to_client(state, table_entry, entry->request_id, &entry->oper, result);
     }
 }
 
@@ -429,7 +424,6 @@ process_prepare_ok(NodeState *state, int conn_idx, ByteView msg)
         return HR_OK; // Drop
 
     if (message.view_number > state->view_number) {
-        // TODO: When can this happen?
         state->view_number = message.view_number;
         begin_state_transfer(state, message.sender_idx);
         return HR_OK;
@@ -485,6 +479,7 @@ complete_view_change_and_become_primary(NodeState *state)
 
     state->status = STATUS_NORMAL;
     state->last_normal_view = state->view_number;
+    node_log(state, "STATUS NORMAL", "became primary (view change complete)");
 
     // Apply committed entries that haven't been executed yet.
     // The state machine has only been updated up to the old
@@ -505,8 +500,6 @@ complete_view_change_and_become_primary(NodeState *state)
         entry->votes = 0;
         add_vote(&entry->votes, self_idx(state));
     }
-
-    node_log(state, "STATUS NORMAL", "became primary (view change complete)");
 
     BeginViewMessage begin_view_message = {
         .base = {
@@ -540,11 +533,13 @@ process_do_view_change(NodeState *state, int conn_idx, ByteView msg)
         message.sender_idx, message.view_number, message.old_view_number,
         message.op_number, message.commit_index);
 
-    // Only process if we're still doing a view change.
-    // After completing a view change, status becomes NORMAL and
-    // we must not re-process stale DO_VIEW_CHANGE messages.
-    if (state->status != STATUS_CHANGE_VIEW)
-        return HR_OK;
+    // TODO: This should trigger a view change in replicas running
+    //       under normal operation
+    //
+    // VRR 4.2: A replica notices the need for a view change either based
+    //          on its own timer, or because it receives a STARTVIEWCHANGE
+    //          or DOVIEWCHANGE message for a view with a larger number than
+    //          its own view-number.
 
     // Only process if the view matches what we're transitioning to
     if (message.view_number != state->view_number)
@@ -556,13 +551,15 @@ process_do_view_change(NodeState *state, int conn_idx, ByteView msg)
 
             state->view_change_old_view = message.old_view_number;
 
+            LogEntry *entries = (LogEntry*) (msg.ptr + sizeof(DoViewChangeMessage));
+
             // Parse the variable-sized log from the message
             int num_entries = (msg.len - sizeof(DoViewChangeMessage)) / sizeof(LogEntry);
             if (num_entries != message.op_number)
                 return HR_INVALID_MESSAGE; // Message size mismatch
 
             log_free(&state->view_change_log);
-            if (log_init_from_network(&state->view_change_log, msg.ptr + sizeof(DoViewChangeMessage), num_entries) < 0)
+            if (log_init_from_network(&state->view_change_log, entries, num_entries) < 0)
                 return HR_OUT_OF_MEMORY;
         }
 
@@ -590,9 +587,6 @@ process_recovery(NodeState *state, int conn_idx, ByteView msg)
     memcpy(&recovery_message, msg.ptr, sizeof(recovery_message));
 
     node_log(state, "RECV RECOVERY", "from=%d nonce=%lu", recovery_message.sender_idx, recovery_message.nonce);
-
-    if (state->status != STATUS_NORMAL)
-        return HR_OK; // Ignore message.
 
     node_log(state, "SEND RECOVERY_RESP", "to=%d view=%lu is_primary=%s",
         recovery_message.sender_idx, state->view_number, is_leader(state) ? "yes" : "no");
@@ -648,10 +642,10 @@ perform_log_transfer_for_view_change(NodeState *state)
             .commit_index = state->commit_index,
             .sender_idx = self_idx(state),
         };
+        send_to_peer_ex(state, leader_idx(state), &do_view_change_message.base, state->log.entries, state->log.count * sizeof(LogEntry));
         node_log(state, "SEND DO_VIEW_CHANGE", "to=%d view=%lu old_view=%lu log=%d commit=%d",
             leader_idx(state), state->view_number, state->last_normal_view,
             state->log.count, state->commit_index);
-        send_to_peer_ex(state, leader_idx(state), &do_view_change_message.base, state->log.entries, state->log.count * sizeof(LogEntry));
     }
 
     // Clear the future array since we're changing views
@@ -672,12 +666,6 @@ process_begin_view_change(NodeState *state, int conn_idx, ByteView msg)
 
     node_log(state, "RECV BEGIN_VIEW_CHG", "from=%d view=%lu", message.sender_idx, message.view_number);
 
-    if (state->status == STATUS_RECOVERY)
-        return HR_OK;
-
-    assert(state->status == STATUS_NORMAL
-        || state->status == STATUS_CHANGE_VIEW);
-
     // Ignore old messages
     if (message.view_number < state->view_number)
         return HR_OK;
@@ -696,7 +684,6 @@ process_begin_view_change(NodeState *state, int conn_idx, ByteView msg)
     // to the view change state.
     if (message.view_number > state->view_number) {
 
-        // Send our own BeginViewChange to all peers
         BeginViewChangeMessage message_2 = {
             .base = {
                 .version = MESSAGE_VERSION,
@@ -706,19 +693,22 @@ process_begin_view_change(NodeState *state, int conn_idx, ByteView msg)
             .view_number = message.view_number,
             .sender_idx = self_idx(state),
         };
-        node_log(state, "SEND BEGIN_VIEW_CHG", "to=* view=%lu", message.view_number);
         broadcast_to_peers(state, &message_2.base);
+        node_log(state, "SEND BEGIN_VIEW_CHG", "to=* view=%lu", message.view_number);
 
         clear_view_change_fields(state);
         state->view_number = message.view_number;
-        node_log(state, "STATUS CHANGE_VIEW", "view=%lu", state->view_number);
-        state->status = STATUS_CHANGE_VIEW;
         state->heartbeat = state->now;
+        state->status = STATUS_CHANGE_VIEW;
+        node_log(state, "STATUS CHANGE_VIEW", "view=%lu", state->view_number);
     }
 
-    add_vote(&state->view_change_begin_votes, message.sender_idx);
+    bool before = reached_quorum(state, state->view_change_begin_votes);
+
     add_vote(&state->view_change_begin_votes, self_idx(state));
-    if (reached_quorum(state, state->view_change_begin_votes)) {
+    add_vote(&state->view_change_begin_votes, message.sender_idx);
+
+    if (!before && reached_quorum(state, state->view_change_begin_votes)) {
         HandlerResult ret = perform_log_transfer_for_view_change(state);
         if (ret != HR_OK)
             return ret;
@@ -749,8 +739,10 @@ process_begin_view(NodeState *state, int conn_idx, ByteView msg)
     state->last_normal_view = state->view_number;
     node_log(state, "STATUS NORMAL", "new view=%lu (follower)", state->view_number);
 
-    // Replace the local log with the authoritative log from the primary
     int num_entries = (msg.len - sizeof(BeginViewMessage)) / sizeof(LogEntry);
+    assert(num_entries >= state->commit_index);
+
+    // Replace the local log with the authoritative log from the primary
     log_free(&state->log);
     if (log_init_from_network(&state->log, msg.ptr + sizeof(BeginViewMessage), num_entries) < 0)
         return HR_OUT_OF_MEMORY;
@@ -771,9 +763,9 @@ process_begin_view(NodeState *state, int conn_idx, ByteView msg)
             .log_index  = state->log.count - 1,
             .view_number = state->view_number,
         };
+        send_to_peer(state, leader_idx(state), &ok_msg.base);
         node_log(state, "SEND PREPARE_OK", "to=%d idx=%d key=%.16s", leader_idx(state), state->log.count - 1,
             state->log.entries[state->log.count - 1].oper.key);
-        send_to_peer(state, leader_idx(state), &ok_msg.base);
     }
 
     advance_commit_index(state, message.commit_index, false);
@@ -819,6 +811,7 @@ process_get_state(NodeState *state, int conn_idx, ByteView msg)
         .view_number  = state->view_number,
         .op_number    = num_entries,
         .commit_index = state->commit_index,
+        .start_index  = start,
     };
     node_log(state, "SEND NEW_STATE", "to=%d entries=%d commit=%d",
         get_state_message.sender_idx, num_entries, state->commit_index);
@@ -833,26 +826,37 @@ process_message_as_leader(NodeState *state,
 {
     switch (type) {
     case MESSAGE_TYPE_REQUEST:
-        return process_request(state, conn_idx, msg);
+        if (state->status == STATUS_NORMAL)
+            return process_request(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_PREPARE_OK:
-        return process_prepare_ok(state, conn_idx, msg);
+        if (state->status == STATUS_NORMAL)
+            return process_prepare_ok(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_DO_VIEW_CHANGE:
-        return process_do_view_change(state, conn_idx, msg);
+        if (state->status == STATUS_CHANGE_VIEW)
+            return process_do_view_change(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_RECOVERY:
-        return process_recovery(state, conn_idx, msg);
+        if (state->status == STATUS_NORMAL)
+            return process_recovery(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_BEGIN_VIEW_CHANGE:
-        return process_begin_view_change(state, conn_idx, msg);
+        if (state->status != STATUS_RECOVERY)
+            return process_begin_view_change(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_BEGIN_VIEW:
-        return process_begin_view(state, conn_idx, msg);
+        if (state->status != STATUS_RECOVERY)
+            return process_begin_view(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_RECOVERY_RESPONSE:
-        // Ignore message.
-        break;
+        return HR_OK;
 
     case MESSAGE_TYPE_GET_STATE:
         return process_get_state(state, conn_idx, msg);
@@ -947,19 +951,20 @@ process_recovery_response(NodeState *state, ByteView msg)
     node_log(state, "RECV RECOVERY_RESP", "from=%d view=%lu commit=%d nonce=%lu",
         message.sender_idx, message.view_number, message.commit_index, message.nonce);
 
-    // 1. Only process responses if we are actually in the recovering state [cite: 237]
-    // 2. Ensure the nonce matches the one we sent to prevent accepting
-    //    delayed responses from previous recovery attempts[cite: 253].
-    if (state->status != STATUS_RECOVERY)
-        return HR_OK;
-
     if (message.nonce != state->recovery_nonce)
         return HR_OK;
 
+    state->recovery_view = MAX(state->recovery_view, message.view_number);
+
     if (should_store_recovery_log(state, message)) {
+
+        LogEntry *entries = (LogEntry*) (msg.ptr + sizeof(RecoveryResponseMessage));
+        int   num_entries = message.op_number + 1;
+
+        assert(num_entries == (int) ((msg.len - sizeof(RecoveryResponseMessage)) / sizeof(LogEntry)));
+
         log_free(&state->recovery_log);
-        if (log_init_from_network(&state->recovery_log, msg.ptr + sizeof(RecoveryResponseMessage),
-            (msg.len - sizeof(RecoveryResponseMessage)) / sizeof(LogEntry)) < 0)
+        if (log_init_from_network(&state->recovery_log, entries, num_entries) < 0)
             return HR_OUT_OF_MEMORY;
 
         state->recovery_log_view = message.view_number;
@@ -967,8 +972,6 @@ process_recovery_response(NodeState *state, ByteView msg)
     }
 
     add_vote(&state->recovery_votes, message.sender_idx);
-    state->recovery_view = MAX(state->recovery_view, message.view_number);
-
     if (reached_quorum(state, state->recovery_votes) && received_recovery_primary(state)) {
         HandlerResult ret = complete_recovery(state);
         if (ret != HR_OK)
@@ -1036,14 +1039,6 @@ static int process_future_list(NodeState *state)
 static HandlerResult
 process_prepare(NodeState *state, ByteView msg)
 {
-    // A recovering node must not process PREPAREs. It doesn't have
-    // the full log yet and adopting a view from a PREPARE would set
-    // last_normal_view to a high value with an empty log, which can
-    // cause a subsequent view change to select this empty log over
-    // the correct one from other replicas.
-    if (state->status == STATUS_RECOVERY)
-        return HR_OK;
-
     PrepareMessage message;
     if (msg.len != sizeof(message))
         return HR_INVALID_MESSAGE;
@@ -1057,48 +1052,29 @@ process_prepare(NodeState *state, ByteView msg)
             message.view_number, message.oper.key, oper_buf);
     }
 
+    // VRR 4.1:  If the sender is behind, the receiver drops the message
     if (message.view_number < state->view_number)
-        return HR_OK; // Stale peer
-
-    if (message.view_number > state->view_number) {
-
-        // The new leader has started a view we haven't seen.
-        // Adopt the new view and process the PREPARE normally.
-
-        state->view_number = message.view_number;
-
-        state->status = STATUS_NORMAL;
-        state->last_normal_view = state->view_number;
-
-        state->view_change_begin_votes = 0;
-        state->num_future = 0;
-        state->state_transfer_pending = false;
-    }
-
-    // A replica that has entered CHANGE_VIEW must not process PREPAREs
-    // for the current view. It has already committed to the view change
-    // by broadcasting BEGIN_VIEW_CHANGE and must wait for the view
-    // change to complete via BEGIN_VIEW. Processing PREPAREs in this
-    // state would advance the log and commit_index without updating
-    // last_normal_view, causing a stale old_view_number in any
-    // subsequent DO_VIEW_CHANGE and potentially leading the new leader
-    // to select a shorter log over this replica's longer one.
-    if (state->status == STATUS_CHANGE_VIEW)
         return HR_OK;
+
+    // VRR 4.1:  If the sender is ahead, the replica performs a state
+    //           transfer: it requests information it is missing from
+    //           the other replicas and uses this information to bring
+    //           itself up to date before processing the message
+    if (message.view_number > state->view_number) {
+        state->view_number = message.view_number;
+        if (state->num_future < FUTURE_LIMIT)
+            state->future[state->num_future++] = message;
+        begin_state_transfer(state, message.sender_idx);
+        return HR_OK;
+    }
 
     if (message.log_index < state->log.count)
         return HR_OK; // Message refers to an old entry. Ignore.
 
     if (message.log_index > state->log.count) {
-
-        // The prepare message for a previous log entry was not received yet.
-        // Buffer this message to process it later (drop if buffer full)
-        if (state->num_future < FUTURE_LIMIT) {
+        if (state->num_future < FUTURE_LIMIT)
             state->future[state->num_future++] = message;
-        }
-
-        // Request missing entries from the primary via State Transfer
-        begin_state_transfer(state, leader_idx(state));
+        begin_state_transfer(state, message.sender_idx);
         return HR_OK;
     }
 
@@ -1122,8 +1098,9 @@ process_prepare(NodeState *state, ByteView msg)
         .log_index  = state->log.count-1,
         .view_number = state->view_number,
     };
-    node_log(state, "SEND PREPARE_OK", "to=%d idx=%d key=%.16s", message.sender_idx, state->log.count-1, message.oper.key);
     send_to_peer(state, message.sender_idx, &ok_message.base);
+    node_log(state, "SEND PREPARE_OK", "to=%d idx=%d key=%.16s",
+        message.sender_idx, state->log.count-1, message.oper.key);
 
     process_future_list(state);
     advance_commit_index(state, message.commit_index, false);
@@ -1144,13 +1121,16 @@ process_commit(NodeState *state, int conn_idx, ByteView msg)
 
     node_log(state, "RECV COMMIT", "commit=%d", message.commit_index);
 
-    // In RECOVERY and VIEW_CHANGE we ignore COMMIT messages.
-    // It's important we don't reset the timer so that the
-    // recovery and view change mechanism can retry on timeout.
-    if (state->status != STATUS_NORMAL)
+    if (message.view_number < state->view_number)
+        return HR_OK; // Stale peer
+
+    if (message.view_number > state->view_number) {
+        begin_state_transfer(state, message.sender_idx);
         return HR_OK;
+    }
 
     advance_commit_index(state, message.commit_index, false);
+
     state->heartbeat = state->now;
     return HR_OK;
 }
@@ -1179,9 +1159,16 @@ process_new_state(NodeState *state, int conn_idx, ByteView msg)
     if (num_entries == 0)
         return HR_OK;
 
-    // Append received entries to our log
+    // Append received entries to our log.
+    // The entries array is a suffix of the sender's log starting at
+    // global position start_index. We skip entries we already have.
     LogEntry *entries = (LogEntry *)((uint8_t *)msg.ptr + sizeof(NewStateMessage));
+    int start_index = new_state_message.start_index;
     for (int i = 0; i < num_entries; i++) {
+
+        int global_idx = start_index + i;
+        if (global_idx < state->log.count)
+            continue; // Already have this entry
 
         LogEntry entry = {
             .oper = entries[i].oper,
@@ -1204,9 +1191,9 @@ process_new_state(NodeState *state, int conn_idx, ByteView msg)
             .log_index   = state->log.count - 1,
             .view_number = state->view_number,
         };
+        send_to_peer(state, leader_idx(state), &prepare_ok_message.base);
         node_log(state, "SEND PREPARE_OK", "to=%d idx=%d key=%.16s", leader_idx(state), state->log.count - 1,
             state->log.entries[state->log.count - 1].oper.key);
-        send_to_peer(state, leader_idx(state), &prepare_ok_message.base);
     }
 
     process_future_list(state);
@@ -1251,22 +1238,34 @@ process_message_as_replica(NodeState *state,
         break;
 
     case MESSAGE_TYPE_PREPARE:
-        return process_prepare(state, msg);
+        if (state->status == STATUS_NORMAL)
+            return process_prepare(state, msg);
+        break;
 
     case MESSAGE_TYPE_COMMIT:
-        return process_commit(state, conn_idx, msg);
+        if (state->status == STATUS_NORMAL)
+            return process_commit(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_BEGIN_VIEW_CHANGE:
-        return process_begin_view_change(state, conn_idx, msg);
+        if (state->status != STATUS_RECOVERY)
+            return process_begin_view_change(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_BEGIN_VIEW:
-        return process_begin_view(state, conn_idx, msg);
+        if (state->status != STATUS_RECOVERY)
+            return process_begin_view(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_RECOVERY:
-        return process_recovery(state, conn_idx, msg);
+        if (state->status == STATUS_NORMAL)
+            return process_recovery(state, conn_idx, msg);
+        break;
 
     case MESSAGE_TYPE_RECOVERY_RESPONSE:
-        return process_recovery_response(state, msg);
+        if (state->status == STATUS_RECOVERY)
+            return process_recovery_response(state, msg);
+        break;
 
     case MESSAGE_TYPE_NEW_STATE:
         return process_new_state(state, conn_idx, msg);
@@ -1337,13 +1336,12 @@ process_message(NodeState *state,
             if (existing < 0) {
                 // No connection tagged with this peer yet, tag this one
                 tcp_set_tag(&state->tcp, conn_idx, sender_idx, false);
-            } else if (existing != conn_idx) {
-                // A different (possibly stale) connection has this tag.
-                // Close the old one and tag the current one.
-                tcp_close(&state->tcp, existing);
-                tcp_set_tag(&state->tcp, conn_idx, sender_idx, false);
             }
-            // If existing == conn_idx, already tagged correctly
+            // If a different connection is already tagged for this peer,
+            // keep it. Closing it would also disconnect the peer end,
+            // which may be carrying data in the opposite direction (e.g.
+            // a DO_VIEW_CHANGE queued on the cross-connection). Stale
+            // connections are detected and cleaned up when sends fail.
         }
     }
 
@@ -1493,6 +1491,7 @@ int node_init(void *state_, int argc, char **argv,
 
     if (previously_crashed) {
         node_log(state, "STATUS RECOVERY", "nonce=%lu (crash detected)", state->recovery_nonce);
+
         // Broadcast RECOVERY to all peers to learn the current view
         RecoveryMessage recovery_message = {
             .base = {
@@ -1503,8 +1502,9 @@ int node_init(void *state_, int argc, char **argv,
             .sender_idx = self_idx(state),
             .nonce = state->recovery_nonce,
         };
-        node_log(state, "SEND RECOVERY", "to=* nonce=%lu", state->recovery_nonce);
         broadcast_to_peers(state, &recovery_message.base);
+        node_log(state, "SEND RECOVERY", "to=* nonce=%lu", state->recovery_nonce);
+
         nearest_deadline(&deadline, state->recovery_time + RECOVERY_TIMEOUT_SEC * 1000000000ULL);
     }
 
@@ -1571,13 +1571,13 @@ int node_tick(void *state_, void **ctxs,
     Time deadline = INVALID_TIME;
 
     if (state->status == STATUS_RECOVERY) {
-
         // Recovery handling runs regardless of leader/replica position,
         // since a recovering node must not act as leader until it learns
         // the current view from its peers.
         Time recovery_deadline = state->recovery_time + RECOVERY_TIMEOUT_SEC * 1000000000ULL;
         if (recovery_deadline <= state->now) {
             node_log_simple(state, "TIMEOUT RECOVERY");
+
             RecoveryMessage recovery_message = {
                 .base = {
                     .version = MESSAGE_VERSION,
@@ -1587,67 +1587,29 @@ int node_tick(void *state_, void **ctxs,
                 .sender_idx = self_idx(state),
                 .nonce = state->recovery_nonce,
             };
-            node_log(state, "SEND RECOVERY", "to=* nonce=%lu", state->recovery_nonce);
             broadcast_to_peers(state, &recovery_message.base);
+            node_log(state, "SEND RECOVERY", "to=* nonce=%lu", state->recovery_nonce);
+
             state->recovery_votes = 0;
             state->recovery_log_view = 0;
             state->recovery_time = state->now;
+
         } else {
             nearest_deadline(&deadline, recovery_deadline);
         }
+    } else if (state->status == STATUS_CHANGE_VIEW) {
 
-    } else if (is_leader(state)) {
+        Time view_change_deadline = state->heartbeat + VIEW_CHANGE_TIMEOUT_SEC * 1000000000ULL;
+        if (view_change_deadline <= state->now) {
 
-        Time heartbeat_deadline = state->heartbeat + HEARTBEAT_INTERVAL_SEC * 1000000000ULL;
-        if (heartbeat_deadline <= state->now) { // TODO: check the time conversion here
-            CommitMessage commit_message = {
-                .base = {
-                    .version = MESSAGE_VERSION,
-                    .type    = MESSAGE_TYPE_COMMIT,
-                    .length  = sizeof(CommitMessage),
-                },
-                .commit_index = state->commit_index,
-            };
-            node_log(state, "SEND COMMIT", "to=* commit=%d", state->commit_index);
-            broadcast_to_peers(state, &commit_message.base);
+            node_log_simple(state, "TIMEOUT CHANGE_VIEW");
+
+            clear_view_change_fields(state);
+
+            add_vote(&state->view_change_begin_votes, self_idx(state));
+
+            state->view_number++;
             state->heartbeat = state->now;
-        } else {
-            nearest_deadline(&deadline, heartbeat_deadline);
-        }
-
-    } else {
-
-        // State transfer retry: if we're waiting for missing log entries
-        // and the timeout has elapsed, re-send GET_STATE to the primary.
-        if (state->state_transfer_pending) {
-
-            Time st_deadline = state->state_transfer_time + STATE_TRANSFER_TIMEOUT_SEC * 1000000000ULL;
-            if (st_deadline <= state->now) {
-                node_log(state, "TIMEOUT STATE_TRANSFER", "op=%d", state->log.count);
-                GetStateMessage get_state_message = {
-                    .base = {
-                        .version = MESSAGE_VERSION,
-                        .type    = MESSAGE_TYPE_GET_STATE,
-                        .length  = sizeof(GetStateMessage),
-                    },
-                    .view_number = state->view_number,
-                    .op_number   = state->log.count,
-                    .sender_idx  = self_idx(state),
-                };
-                node_log(state, "SEND GET_STATE", "to=%d op=%d", leader_idx(state), state->log.count);
-                send_to_peer(state, leader_idx(state), &get_state_message.base);
-                state->state_transfer_time = state->now;
-            } else {
-                nearest_deadline(&deadline, st_deadline);
-            }
-        }
-
-        int death_timeout = (state->status == STATUS_CHANGE_VIEW)
-            ? VIEW_CHANGE_TIMEOUT_SEC : PRIMARY_DEATH_TIMEOUT_SEC;
-        Time death_deadline = state->heartbeat + death_timeout * 1000000000ULL;
-        if (death_deadline <= state->now) {
-
-            node_log_simple(state, "TIMEOUT PRIMARY_DEATH");
 
             BeginViewChangeMessage begin_view_change_message = {
                 .base = {
@@ -1655,18 +1617,99 @@ int node_tick(void *state_, void **ctxs,
                     .type    = MESSAGE_TYPE_BEGIN_VIEW_CHANGE,
                     .length  = sizeof(BeginViewChangeMessage),
                 },
-                .view_number = state->view_number + 1,
+                .view_number = state->view_number,
                 .sender_idx = self_idx(state),
             };
-            node_log(state, "SEND BEGIN_VIEW_CHG", "to=* view=%lu", state->view_number + 1);
+            node_log(state, "SEND BEGIN_VIEW_CHG", "to=* view=%lu", state->view_number);
             broadcast_to_peers(state, &begin_view_change_message.base);
 
-            state->status = STATUS_CHANGE_VIEW;
-            node_log(state, "STATUS CHANGE_VIEW", "view=%lu", state->view_number + 1);
-            state->heartbeat = state->now;
+        } else {
+            nearest_deadline(&deadline, view_change_deadline);
+        }
+    } else {
+        assert(state->status == STATUS_NORMAL);
+
+        if (is_leader(state)) {
+            Time heartbeat_deadline = state->heartbeat + HEARTBEAT_INTERVAL_SEC * 1000000000ULL;
+            if (heartbeat_deadline <= state->now) { // TODO: check the time conversion here
+
+                CommitMessage commit_message = {
+                    .base = {
+                        .version = MESSAGE_VERSION,
+                        .type    = MESSAGE_TYPE_COMMIT,
+                        .length  = sizeof(CommitMessage),
+                    },
+                    .view_number = state->view_number,
+                    .sender_idx = self_idx(state),
+                    .commit_index = state->commit_index,
+                };
+                broadcast_to_peers(state, &commit_message.base);
+                node_log(state, "SEND COMMIT", "to=* commit=%d", state->commit_index);
+
+                state->heartbeat = state->now;
+
+            } else {
+                nearest_deadline(&deadline, heartbeat_deadline);
+            }
+        } else {
+            Time death_deadline = state->heartbeat + PRIMARY_DEATH_TIMEOUT_SEC * 1000000000ULL;
+            if (death_deadline <= state->now) {
+
+                node_log_simple(state, "TIMEOUT PRIMARY_DEATH");
+
+                clear_view_change_fields(state);
+
+                add_vote(&state->view_change_begin_votes, self_idx(state));
+
+                state->view_number++;
+                state->status = STATUS_CHANGE_VIEW;
+                state->heartbeat = state->now;
+
+                BeginViewChangeMessage begin_view_change_message = {
+                    .base = {
+                        .version = MESSAGE_VERSION,
+                        .type    = MESSAGE_TYPE_BEGIN_VIEW_CHANGE,
+                        .length  = sizeof(BeginViewChangeMessage),
+                    },
+                    .view_number = state->view_number,
+                    .sender_idx = self_idx(state),
+                };
+                node_log(state, "SEND BEGIN_VIEW_CHG", "to=* view=%lu", state->view_number);
+                broadcast_to_peers(state, &begin_view_change_message.base);
+
+                node_log(state, "STATUS CHANGE_VIEW", "view=%lu", state->view_number);
+
+            } else {
+                nearest_deadline(&deadline, death_deadline);
+            }
+        }
+    }
+
+    // State transfer retry: if we're waiting for missing log entries
+    // and the timeout has elapsed, re-send GET_STATE to the primary.
+    if (state->state_transfer_pending) {
+
+        Time st_deadline = state->state_transfer_time + STATE_TRANSFER_TIMEOUT_SEC * 1000000000ULL;
+        if (st_deadline <= state->now) {
+            node_log(state, "TIMEOUT STATE_TRANSFER", "op=%d", state->log.count);
+
+            GetStateMessage get_state_message = {
+                .base = {
+                    .version = MESSAGE_VERSION,
+                    .type    = MESSAGE_TYPE_GET_STATE,
+                    .length  = sizeof(GetStateMessage),
+                },
+                .view_number = state->view_number,
+                .op_number   = state->log.count,
+                .sender_idx  = self_idx(state),
+            };
+            send_to_peer(state, leader_idx(state), &get_state_message.base);
+            node_log(state, "SEND GET_STATE", "to=%d op=%d", leader_idx(state), state->log.count);
+
+            state->state_transfer_time = state->now;
 
         } else {
-            nearest_deadline(&deadline, death_deadline);
+            nearest_deadline(&deadline, st_deadline);
         }
     }
 

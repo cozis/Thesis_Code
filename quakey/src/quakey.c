@@ -2635,8 +2635,8 @@ static int change_target_partition(Sim *sim)
 
     host_pair_list_free(&sim->target_partition);
     sim->target_partition = list;
-    //SIM_TRACE(sim, "PARTITION: new target partition with %d broken links (%d buckets)",
-    //    list.count, num_buckets);
+    SIM_TRACE(sim, "PARTITION: new target partition with %d broken links (%d buckets)",
+        list.count, num_buckets);
     return 0;
 }
 
@@ -2735,8 +2735,8 @@ static bool break_link(Sim *sim)
 
     host_pair_list_add(&sim->partition, pair.a, pair.b);
     drop_conns_between_hosts(sim, pair.a, pair.b);
-    //SIM_TRACE(sim, "PARTITION: break link %s <-> %s (%d broken links)",
-    //    pair.a->name, pair.b->name, sim->partition.count);
+    SIM_TRACE(sim, "PARTITION: break link %s <-> %s (%d broken links)",
+        pair.a->name, pair.b->name, sim->partition.count);
     return true;
 }
 
@@ -2748,10 +2748,10 @@ static bool repair_link(Sim *sim)
     if (idx < 0)
         return false;
 
-    //HostPair pair = sim->partition.pairs[idx];
+    HostPair pair = sim->partition.pairs[idx];
     host_pair_list_remove_at(&sim->partition, idx);
-    //SIM_TRACE(sim, "PARTITION: repair link %s <-> %s (%d broken links)",
-    //    pair.a->name, pair.b->name, sim->partition.count);
+    SIM_TRACE(sim, "PARTITION: repair link %s <-> %s (%d broken links)",
+        pair.a->name, pair.b->name, sim->partition.count);
     return true;
 }
 

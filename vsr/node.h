@@ -64,6 +64,8 @@ typedef struct {
 
 typedef struct {
     MessageHeader base;
+    uint64_t view_number;
+    int sender_idx;
     int commit_index;
 } CommitMessage;
 
@@ -125,6 +127,7 @@ typedef struct {
     uint64_t view_number;
     int op_number;      // Number of log entries that follow
     int commit_index;
+    int start_index;    // Global log index of the first entry in the suffix
     // Followed by: LogEntry log[op_number]
 } NewStateMessage;
 

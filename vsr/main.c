@@ -167,6 +167,9 @@ int main(int argc, char **argv)
 #ifdef MAIN_CLIENT
 
 #include <poll.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "client.h"
 
@@ -174,6 +177,8 @@ int main(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
+
     int ret;
     ClientState state;
 

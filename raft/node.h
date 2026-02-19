@@ -69,6 +69,7 @@ typedef struct {
 typedef struct {
     MessageHeader base;
     int leader_idx;
+    uint64_t request_id;
 } RedirectMessage;
 
 typedef enum {

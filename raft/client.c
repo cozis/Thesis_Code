@@ -79,6 +79,16 @@ process_message(ClientState *state,
             return -1;
         memcpy(&redirect_message, msg.ptr, sizeof(redirect_message));
 
+        // Ignore stale redirects from previous requests. A redirect
+        // from server A for request N-1 can arrive after the client
+        // has already moved on to request N with server B. Without
+        // this check, the stale redirect would falsely cancel the
+        // current request, causing the client and linearizability
+        // checker to believe the request was rejected even though
+        // the new server may have committed it.
+        if (redirect_message.request_id != state->request_id)
+            return 0;
+
         if (redirect_message.leader_idx >= 0 && redirect_message.leader_idx < state->num_servers) {
             CLIENT_TRACE("Redirected to leader %d", redirect_message.leader_idx);
             state->current_leader = redirect_message.leader_idx;
